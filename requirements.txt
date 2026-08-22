@@ -1,5 +1,5 @@
 streamlit>=1.38.0
-futu-api
+streamlit-oauth>=0.1.12
+requests>=2.31.0
 pandas>=2.0.0
-numpy>=1.26.0
 plotly>=5.22.0
