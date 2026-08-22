@@ -7,6 +7,41 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
+@router.get("/snapshot")
+def get_snapshot(tickers: str):
+    """Multi-ticker snapshot: ?tickers=SPY,QQQ,AAPL"""
+    symbols_map = {}
+    futu_symbols = []
+    for t in [t.strip().upper() for t in tickers.split(",") if t.strip()]:
+        sym = us_symbol(t)
+        symbols_map[sym] = t
+        futu_symbols.append(sym)
+
+    ctx = get_quote_ctx()
+    try:
+        ret, data = ctx.get_market_snapshot(futu_symbols)
+        if ret != ft.RET_OK:
+            raise HTTPException(status_code=404, detail=f"Snapshot error: {data}")
+        quotes = []
+        for _, row in data.iterrows():
+            code = str(row.get("code", ""))
+            ticker_label = symbols_map.get(code, code.replace("US.", ""))
+            quotes.append({
+                "symbol": ticker_label,
+                "last": float(row.get("last_price", 0)),
+                "change": float(row.get("change_val", 0)),
+                "change_pct": float(row.get("change_rate", 0)),
+                "volume": int(row.get("volume", 0)),
+                "high": float(row.get("high_price", 0)),
+                "low": float(row.get("low_price", 0)),
+                "open": float(row.get("open_price", 0)),
+                "prev_close": float(row.get("prev_close_price", 0)),
+            })
+        return {"quotes": quotes}
+    finally:
+        ctx.close()
+
+
 @router.get("/{ticker}")
 def get_quote(ticker: str):
     symbol = us_symbol(ticker)
