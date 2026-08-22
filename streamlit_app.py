@@ -1,18 +1,15 @@
 """
 Subba US Options Analyzer — Streamlit Cloud app.
 Real-time MooMoo data via gateway-free REST API (webapi.moomoo.com).
-OAuth 2.1 + PKCE login — no FutuOpenD needed.
+AppKey Ed25519 signature authentication — no FutuOpenD, no OAuth login.
 
-Setup (one-time):
-  1. Go to https://open.moomoo.com → sign in → Developer → Create App
-  2. Set redirect URI to your Streamlit app URL
-  3. Copy your Client ID
-  4. In Streamlit Cloud → App secrets, add:
-       MOOMOO_CLIENT_ID = "your_client_id"
-       REDIRECT_URI = "https://your-app.streamlit.app"
+Streamlit secrets required:
+  MOOMOO_APP_KEY_ID = "2262a22a2faaf381a2e740db195e4864"
+  MOOMOO_PRIVATE_KEY = \"\"\"-----BEGIN PRIVATE KEY-----
+  ...your Ed25519 private key...
+  -----END PRIVATE KEY-----\"\"\"
 """
-import os
-import time
+import os, time, base64, secrets as _sec, urllib.parse
 import requests
 import pandas as pd
 import plotly.graph_objects as go
@@ -38,191 +35,84 @@ div[data-testid="metric-container"] {
 </style>
 """, unsafe_allow_html=True)
 
-# ── MooMoo OAuth + REST API constants ────────────────────────────────────────
+MOOMOO_API = "https://webapi.moomoo.com/api/v1.0"
 
-MOOMOO_API       = "https://webapi.moomoo.com/api/v1.0"
-AUTHORIZE_URL    = "https://webapi.moomoo.com/oauth2/authorize/confirm"
-TOKEN_URL        = "https://webapi.moomoo.com/oauth2/token"
-REGISTER_URL     = "https://webapi.moomoo.com/oauth2/register"
-
-# ── OAuth config from Streamlit secrets ──────────────────────────────────────
+# ── Secrets ───────────────────────────────────────────────────────────────────
 
 def _secret(key: str, default: str = "") -> str:
     if hasattr(st, "secrets") and key in st.secrets:
         return str(st.secrets[key])
     return os.environ.get(key, default)
 
+APP_KEY_ID      = _secret("MOOMOO_APP_KEY_ID")
+PRIVATE_KEY_PEM = _secret("MOOMOO_PRIVATE_KEY")
 
-CLIENT_ID    = _secret("MOOMOO_CLIENT_ID")
-REDIRECT_URI = _secret("REDIRECT_URI", "http://localhost:8501")
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# OAUTH SETUP SCREEN (shown if no client_id configured)
-# ════════════════════════════════════════════════════════════════════════════
-
-if not CLIENT_ID:
+if not APP_KEY_ID or not PRIVATE_KEY_PEM:
     st.title("Subba US Options — Setup")
-    st.error("**MOOMOO_CLIENT_ID** not configured in Streamlit secrets.")
-
+    st.error("Add **MOOMOO_APP_KEY_ID** and **MOOMOO_PRIVATE_KEY** to Streamlit secrets.")
     st.markdown("""
-    ### One-time setup (takes ~2 minutes)
-
-    **Step 1** — Register your app on MooMoo developer portal:
-    1. Go to **[open.moomoo.com](https://open.moomoo.com)** and sign in with your MooMoo account
-    2. Click **Developer** → **Create Application**
-    3. Set the **Redirect URI** to your Streamlit app URL:
-       ```
-       https://stockanalyser-subba-us.streamlit.app
-       ```
-    4. Copy your **Client ID**
-
-    **Step 2** — Add to Streamlit Cloud secrets:
-
-    In your Streamlit app → **⋮ Menu** → **Settings** → **Secrets**, add:
+    In Streamlit Cloud → App **⋮ Menu → Settings → Secrets**, add:
     ```toml
-    MOOMOO_CLIENT_ID = "paste_your_client_id_here"
-    REDIRECT_URI = "https://stockanalyser-subba-us.streamlit.app"
+    MOOMOO_APP_KEY_ID = "2262a22a2faaf381a2e740db195e4864"
+    MOOMOO_PRIVATE_KEY = \"\"\"-----BEGIN PRIVATE KEY-----
+    paste_your_private_key_here
+    -----END PRIVATE KEY-----\"\"\"
     ```
-
-    **Step 3** — Reopen the app → click **Login with MooMoo** → done!
+    Get both from **open.moomoo.com → AppKey Management**.
     """)
-
-    st.info("The MooMoo developer portal provides a Client ID for their gateway-free REST API — same concept as Kite Connect's API key.")
     st.stop()
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# OAUTH LOGIN  (pure server-side PKCE — no browser JS, no CORS issues)
-# ════════════════════════════════════════════════════════════════════════════
+# ── Ed25519 signing ───────────────────────────────────────────────────────────
 
-import hashlib, base64, secrets as _secrets, urllib.parse
+@st.cache_resource
+def _load_pk():
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    pem = PRIVATE_KEY_PEM.strip()
+    if pem.startswith("-----"):
+        return load_pem_private_key(pem.encode(), password=None)
+    # raw base64 seed (32 bytes)
+    return Ed25519PrivateKey.from_private_bytes(base64.b64decode(pem))
 
 
-CLIENT_SECRET = _secret("MOOMOO_CLIENT_SECRET", "")
-
-
-def _build_auth_url() -> str:
-    if "oauth_state" not in st.session_state:
-        st.session_state.oauth_state = _secrets.token_urlsafe(16)
-    params = {
-        "client_id":     CLIENT_ID,
-        "redirect_uri":  REDIRECT_URI,
-        "response_type": "code",
-        "state":         st.session_state.oauth_state,
+def _auth_headers(params: dict = None) -> dict:
+    """Build AppKey authentication headers for one request."""
+    ts    = str(int(time.time()))
+    nonce = _sec.token_hex(8)
+    # Canonical string to sign
+    parts = [APP_KEY_ID, ts, nonce]
+    if params:
+        qs = "&".join(f"{k}={urllib.parse.quote(str(v), safe='')}"
+                      for k, v in sorted(params.items()))
+        parts.append(qs)
+    message   = "\n".join(parts).encode()
+    signature = _load_pk().sign(message)
+    sig_b64   = base64.b64encode(signature).decode()
+    return {
+        "Authorization": f"AppKey {APP_KEY_ID}:{ts}:{nonce}:{sig_b64}",
+        "Content-Type":  "application/json",
     }
-    return f"{AUTHORIZE_URL}?{urllib.parse.urlencode(params)}"
 
 
-def _exchange_code(code: str) -> bool:
-    """Exchange auth code for token (form-encoded, server-side)."""
-    payload = {
-        "grant_type":   "authorization_code",
-        "code":         code,
-        "redirect_uri": REDIRECT_URI,
-        "client_id":    CLIENT_ID,
-    }
-    if CLIENT_SECRET:
-        payload["client_secret"] = CLIENT_SECRET
-
-    resp = requests.post(
-        TOKEN_URL,
-        data=payload,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=20,
-    )
-    if resp.ok:
-        td = resp.json()
-        st.session_state.token = td
-        st.session_state.token_expires_at = time.time() + td.get("expires_in", 7200) - 60
-        return True
-    st.error(f"Token exchange failed ({resp.status_code})")
-    with st.expander("Error detail"):
-        st.code(resp.text)
-    return False
-
-
-if "token" not in st.session_state:
-    qp = st.query_params
-    if "error" in qp:
-        st.error(f"MooMoo returned error: **{qp['error']}** — {qp.get('error_description', '')}")
-        if st.button("Try again"):
-            st.query_params.clear()
-            st.rerun()
-        st.stop()
-
-    if "code" in qp:
-        with st.spinner("Logging in…"):
-            ok = _exchange_code(qp["code"])
-        if ok:
-            st.query_params.clear()
-            st.rerun()
-        else:
-            if st.button("Try again"):
-                st.query_params.clear()
-                st.rerun()
-        st.stop()
-
-    st.title("Subba US Options")
-    st.markdown("Real-time MooMoo data — **no local software needed**.")
-    st.divider()
-    auth_url = _build_auth_url()
-    st.link_button("Login with MooMoo 📈", auth_url, type="primary")
-
-    st.stop()
-
-
-# ── Token refresh ─────────────────────────────────────────────────────────────
-
-def _refresh_token():
-    rt = st.session_state.token.get("refresh_token")
-    if not rt:
-        return
-    payload = {"grant_type": "refresh_token", "refresh_token": rt, "client_id": CLIENT_ID}
-    if CLIENT_SECRET:
-        payload["client_secret"] = CLIENT_SECRET
-    resp = requests.post(
-        TOKEN_URL,
-        data=payload,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=15,
-    )
-    if resp.ok:
-        td = resp.json()
-        st.session_state.token = td
-        st.session_state.token_expires_at = time.time() + td.get("expires_in", 7200) - 60
-
-
-if time.time() > st.session_state.get("token_expires_at", float("inf")):
-    _refresh_token()
-
-ACCESS_TOKEN = st.session_state.token.get("access_token", "")
-
-
-def _auth_headers():
-    return {"Authorization": f"Bearer {ACCESS_TOKEN}"}
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# REST API HELPERS
-# ════════════════════════════════════════════════════════════════════════════
+# ── REST helpers ──────────────────────────────────────────────────────────────
 
 def _get(path: str, params: dict = None, timeout: int = 30):
     try:
         r = requests.get(
             f"{MOOMOO_API}{path}",
-            headers=_auth_headers(),
+            headers=_auth_headers(params),
             params=params,
             timeout=timeout,
         )
-        if r.status_code == 401:
-            st.session_state.pop("token", None)
-            st.error("Session expired. Please log in again.")
-            st.stop()
-        r.raise_for_status()
+        if not r.ok:
+            st.error(f"API {path} → {r.status_code}")
+            with st.expander("Error detail"):
+                st.code(r.text)
+            return None
         return r.json()
     except requests.RequestException as e:
-        st.error(f"API error {path}: {e}")
+        st.error(f"Network error {path}: {e}")
         return None
 
 
@@ -231,7 +121,7 @@ def us(ticker: str) -> str:
     return t if t.startswith("US.") else f"US.{t}"
 
 
-# ── Cached data functions ─────────────────────────────────────────────────────
+# ── Cached data ───────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_snapshot(tickers_csv: str):
@@ -249,36 +139,18 @@ def fetch_expirations(ticker: str):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_option_chain(ticker: str, expiry: str):
-    """Returns raw chain data from REST API."""
     return _get("/quote/option-chain", {
         "code": us(ticker),
         "start_strike_time": expiry,
-        "end_strike_time": expiry,
+        "end_strike_time":   expiry,
     }, timeout=60)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_option_snapshot(option_codes_csv: str):
-    return _get("/quote/market-snapshot", {"code_list": option_codes_csv})
-
-
-@st.cache_data(ttl=120, show_spinner=False)
-def fetch_acc_info():
-    return _get("/account/acc-info")
-
-
-@st.cache_data(ttl=120, show_spinner=False)
-def fetch_positions():
-    return _get("/account/position-list")
-
-
 def _parse_chain_rows(chain_data, expiry: str):
-    """Parse REST API option chain response into list of dicts."""
     if not chain_data or "data" not in chain_data:
         return []
     rows = []
-    option_list = chain_data["data"].get("option_chain", [])
-    for item in option_list:
+    for item in chain_data["data"].get("option_chain", []):
         for opt_type in ["call", "put"]:
             opts = item.get(opt_type, [])
             if not isinstance(opts, list):
@@ -287,18 +159,18 @@ def _parse_chain_rows(chain_data, expiry: str):
                 if not opt:
                     continue
                 rows.append({
-                    "code": opt.get("code", ""),
-                    "strike": float(opt.get("strike_price", 0)),
-                    "option_type": "CALL" if opt_type == "call" else "PUT",
-                    "last": float(opt.get("last_price", 0)),
-                    "bid":  float(opt.get("bid_price", 0)),
-                    "ask":  float(opt.get("ask_price", 0)),
-                    "open_interest": int(opt.get("open_interest", 0)),
-                    "volume": int(opt.get("volume", 0)),
-                    "iv":    float(opt.get("implied_volatility", 0)),
-                    "delta": float(opt.get("delta", 0)),
-                    "gamma": float(opt.get("gamma", 0)),
-                    "theta": float(opt.get("theta", 0)),
+                    "code":          opt.get("code", ""),
+                    "strike":        float(opt.get("strike_price", 0)),
+                    "option_type":   "CALL" if opt_type == "call" else "PUT",
+                    "last":          float(opt.get("last_price",        0)),
+                    "bid":           float(opt.get("bid_price",         0)),
+                    "ask":           float(opt.get("ask_price",         0)),
+                    "open_interest": int(opt.get("open_interest",       0)),
+                    "volume":        int(opt.get("volume",              0)),
+                    "iv":            float(opt.get("implied_volatility", 0)),
+                    "delta":         float(opt.get("delta",             0)),
+                    "gamma":         float(opt.get("gamma",             0)),
+                    "theta":         float(opt.get("theta",             0)),
                 })
     return rows
 
@@ -312,13 +184,11 @@ def _spot_from_snapshot(snap_data, ticker: str) -> float:
     return 0.0
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# ANALYSIS HELPERS
-# ════════════════════════════════════════════════════════════════════════════
+# ── Analysis helpers ──────────────────────────────────────────────────────────
 
 def calc_pcr(rows):
-    ce = sum(r.get("open_interest", 0) for r in rows if r["option_type"] == "CALL")
-    pe = sum(r.get("open_interest", 0) for r in rows if r["option_type"] == "PUT")
+    ce = sum(r["open_interest"] for r in rows if r["option_type"] == "CALL")
+    pe = sum(r["open_interest"] for r in rows if r["option_type"] == "PUT")
     return round(pe / ce, 4) if ce > 0 else 0.0
 
 
@@ -331,7 +201,7 @@ def calc_max_pain(rows):
         s = r["strike"]
         if s not in by_s:
             by_s[s] = {"ce": 0, "pe": 0}
-        by_s[s]["ce" if r["option_type"] == "CALL" else "pe"] += r.get("open_interest", 0)
+        by_s[s]["ce" if r["option_type"] == "CALL" else "pe"] += r["open_interest"]
     best, best_s = float("inf"), strikes[0]
     for ts in strikes:
         pain = sum(
@@ -344,72 +214,59 @@ def calc_max_pain(rows):
 
 
 def score_signal(rows, spot, pcr, max_pain):
-    score = 0
-    details = []
-
-    if pcr >= 1.3:   score += 2; details.append(("PCR", f"{pcr:.2f}", "Bullish 🟢", "Heavy put writing"))
+    score, details = 0, []
+    if   pcr >= 1.3: score += 2; details.append(("PCR", f"{pcr:.2f}", "Bullish 🟢",       "Heavy put writing"))
     elif pcr >= 1.0: score += 1; details.append(("PCR", f"{pcr:.2f}", "Mildly Bullish 🟡", "More puts"))
-    elif pcr <= 0.7: score -= 2; details.append(("PCR", f"{pcr:.2f}", "Bearish 🔴", "Heavy call writing"))
-    elif pcr < 1.0:  score -= 1; details.append(("PCR", f"{pcr:.2f}", "Mildly Bearish 🟡", "More calls"))
-    else:            details.append(("PCR", f"{pcr:.2f}", "Neutral ⚪", "Balanced OI"))
+    elif pcr <= 0.7: score -= 2; details.append(("PCR", f"{pcr:.2f}", "Bearish 🔴",        "Heavy call writing"))
+    elif pcr <  1.0: score -= 1; details.append(("PCR", f"{pcr:.2f}", "Mildly Bearish 🟡", "More calls"))
+    else:                         details.append(("PCR", f"{pcr:.2f}", "Neutral ⚪",         "Balanced OI"))
 
     mp_pct = (spot - max_pain) / max_pain * 100 if max_pain else 0
-    if mp_pct > 1.0:    score -= 2; details.append(("Max Pain", f"+{mp_pct:.1f}%", "Bearish 🔴", "Spot above MP"))
-    elif mp_pct > 0.3:  score -= 1; details.append(("Max Pain", f"+{mp_pct:.1f}%", "Mildly Bearish 🟡", ""))
-    elif mp_pct < -1.0: score += 2; details.append(("Max Pain", f"{mp_pct:.1f}%", "Bullish 🟢", "Spot below MP"))
-    elif mp_pct < -0.3: score += 1; details.append(("Max Pain", f"{mp_pct:.1f}%", "Mildly Bullish 🟡", ""))
-    else:               details.append(("Max Pain", f"{mp_pct:.1f}%", "Neutral ⚪", "Spot near MP"))
+    if   mp_pct >  1.0: score -= 2; details.append(("Max Pain", f"+{mp_pct:.1f}%", "Bearish 🔴",       "Spot above MP"))
+    elif mp_pct >  0.3: score -= 1; details.append(("Max Pain", f"+{mp_pct:.1f}%", "Mildly Bearish 🟡",""))
+    elif mp_pct < -1.0: score += 2; details.append(("Max Pain", f"{mp_pct:.1f}%",  "Bullish 🟢",       "Spot below MP"))
+    elif mp_pct < -0.3: score += 1; details.append(("Max Pain", f"{mp_pct:.1f}%",  "Mildly Bullish 🟡",""))
+    else:                            details.append(("Max Pain", f"{mp_pct:.1f}%",  "Neutral ⚪",        "Spot near MP"))
 
     calls = sorted([r for r in rows if r["option_type"] == "CALL"], key=lambda x: x["strike"])
     puts  = sorted([r for r in rows if r["option_type"] == "PUT"],  key=lambda x: x["strike"])
-    max_ce_oi = max((r.get("open_interest", 0) for r in calls), default=0)
-    max_pe_oi = max((r.get("open_interest", 0) for r in puts),  default=0)
-    ce_wall = next((r["strike"] for r in calls if r.get("open_interest", 0) == max_ce_oi), 0)
-    pe_wall = next((r["strike"] for r in puts  if r.get("open_interest", 0) == max_pe_oi), 0)
-    if spot > ce_wall > 0:
-        score += 1; details.append(("OI Walls", f"Spot > CE wall ${ce_wall:.0f}", "Bullish 🟢", "Resistance cleared"))
-    elif 0 < spot < pe_wall:
-        score -= 1; details.append(("OI Walls", f"Spot < PE wall ${pe_wall:.0f}", "Bearish 🔴", "Support broken"))
-    else:
-        details.append(("OI Walls", f"CE ${ce_wall:.0f} | PE ${pe_wall:.0f}", "Neutral ⚪", "Spot between walls"))
+    max_ce_oi = max((r["open_interest"] for r in calls), default=0)
+    max_pe_oi = max((r["open_interest"] for r in puts),  default=0)
+    ce_wall = next((r["strike"] for r in calls if r["open_interest"] == max_ce_oi), 0)
+    pe_wall = next((r["strike"] for r in puts  if r["open_interest"] == max_pe_oi), 0)
+    if   spot > ce_wall > 0:  score += 1; details.append(("OI Walls", f"Spot > CE ${ce_wall:.0f}", "Bullish 🟢",  "Resistance cleared"))
+    elif 0 < spot < pe_wall:  score -= 1; details.append(("OI Walls", f"Spot < PE ${pe_wall:.0f}", "Bearish 🔴",  "Support broken"))
+    else:                                  details.append(("OI Walls", f"CE ${ce_wall:.0f} | PE ${pe_wall:.0f}", "Neutral ⚪", "Spot between walls"))
 
     if   score >=  4: sig = "STRONG BUY CALL 📈"
     elif score >=  2: sig = "BUY CALL 📈"
     elif score <= -4: sig = "STRONG BUY PUT 📉"
     elif score <= -2: sig = "BUY PUT 📉"
     else:             sig = "NEUTRAL — WAIT ⚖️"
-
     return sig, score, details, ce_wall, pe_wall
 
 
 def sig_color(sig: str) -> str:
     s = sig.upper()
     if "STRONG BUY CALL" in s: return "#22c55e"
-    if "BUY CALL" in s:        return "#86efac"
-    if "STRONG BUY PUT" in s:  return "#ef4444"
-    if "BUY PUT" in s:         return "#fca5a5"
+    if "BUY CALL"        in s: return "#86efac"
+    if "STRONG BUY PUT"  in s: return "#ef4444"
+    if "BUY PUT"         in s: return "#fca5a5"
     return "#94a3b8"
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SIDEBAR
-# ════════════════════════════════════════════════════════════════════════════
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
     st.markdown("### 📈 Subba US Options")
-    st.markdown("<span style='color:#22c55e;font-size:0.8rem'>● Logged in — MooMoo REST API</span>", unsafe_allow_html=True)
-    st.caption("Gateway-free · Real-time data")
-
+    st.markdown("<span style='color:#22c55e;font-size:0.8rem'>● Connected — MooMoo REST API</span>",
+                unsafe_allow_html=True)
+    st.caption(f"AppKey: …{APP_KEY_ID[-8:]}")
     page = st.radio(
         "Navigate",
         ["Dashboard", "Options Chain", "OI Signal", "Expiry Analyzer", "OI Scanner", "Smart Signal"],
         label_visibility="collapsed",
     )
-    st.divider()
-    if st.button("Logout"):
-        for k in ["token", "token_expires_at", "pkce_verifier", "pkce_challenge", "oauth_state"]:
-            st.session_state.pop(k, None)
-        st.rerun()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -427,40 +284,22 @@ if page == "Dashboard":
 
     if snap and "data" in snap:
         snap_list = snap["data"].get("snapshot_list", [])
-        cols = st.columns(4)
-        for i, item in enumerate(snap_list):
-            code = str(item.get("code", "")).replace("US.", "")
-            last = float(item.get("last_price", 0))
-            chg  = float(item.get("change_rate", 0))
-            cols[i % 4].metric(code, f"${last:.2f}", delta=f"{chg:+.2f}%", delta_color="normal")
+        if snap_list:
+            cols = st.columns(4)
+            for i, item in enumerate(snap_list):
+                code = str(item.get("code", "")).replace("US.", "")
+                last = float(item.get("last_price", 0))
+                chg  = float(item.get("change_rate", 0))
+                cols[i % 4].metric(code, f"${last:.2f}", delta=f"{chg:+.2f}%", delta_color="normal")
+        else:
+            st.info("No snapshot data returned.")
+            with st.expander("Raw API response"):
+                st.json(snap)
     else:
-        st.info("No quote data — check API connection.")
-
-    st.divider()
-    st.subheader("Account")
-    c1, c2 = st.columns(2)
-    with c1:
-        funds = fetch_acc_info()
-        if funds and "data" in funds:
-            d = funds["data"]
-            st.metric("Cash",         f"${float(d.get('cash', 0)):,.2f}")
-            st.metric("Market Value", f"${float(d.get('market_val', 0)):,.2f}")
-            st.metric("Total Assets", f"${float(d.get('total_assets', 0)):,.2f}")
-        else:
-            st.caption("Account data unavailable.")
-    with c2:
-        pos = fetch_positions()
-        if pos and "data" in pos:
-            rows = pos["data"].get("position_list", [])
-            if rows:
-                df = pd.DataFrame(rows)
-                show = [c for c in ["code","qty","cost_price","market_val","unrealized_pl"] if c in df.columns]
-                st.dataframe(df[show].style.format({"cost_price":"${:.2f}","market_val":"${:.2f}","unrealized_pl":"${:.2f}"}),
-                             use_container_width=True)
-            else:
-                st.caption("No open positions.")
-        else:
-            st.caption("Positions unavailable.")
+        st.info("No data — check API connection or secret values.")
+        if snap:
+            with st.expander("Raw API response"):
+                st.json(snap)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -484,11 +323,11 @@ elif page == "Options Chain":
         chain_raw = fetch_option_chain(ticker, expiry)
         snap_raw  = fetch_snapshot(ticker)
 
-    rows  = _parse_chain_rows(chain_raw, expiry)
-    spot  = _spot_from_snapshot(snap_raw, ticker)
+    rows = _parse_chain_rows(chain_raw, expiry)
+    spot = _spot_from_snapshot(snap_raw, ticker)
 
     if not rows:
-        st.info("No chain data returned. The endpoint format may need adjustment — check MooMoo docs at open.moomoo.com.")
+        st.info("No chain data returned.")
         if chain_raw:
             with st.expander("Raw API response"):
                 st.json(chain_raw)
@@ -515,11 +354,13 @@ elif page == "Options Chain":
     with tab_c:
         if not calls_df.empty:
             cols = [c for c in disp if c in calls_df.columns]
-            st.dataframe(calls_df[cols].style.format({k:v for k,v in fmt.items() if k in cols}), use_container_width=True)
+            st.dataframe(calls_df[cols].style.format({k: v for k, v in fmt.items() if k in cols}),
+                         use_container_width=True)
     with tab_p:
         if not puts_df.empty:
             cols = [c for c in disp if c in puts_df.columns]
-            st.dataframe(puts_df[cols].style.format({k:v for k,v in fmt.items() if k in cols}), use_container_width=True)
+            st.dataframe(puts_df[cols].style.format({k: v for k, v in fmt.items() if k in cols}),
+                         use_container_width=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -558,7 +399,7 @@ elif page == "OI Signal":
         pcr      = calc_pcr(rows)
         max_pain = calc_max_pain(rows)
         signal, score, details, ce_wall, pe_wall = score_signal(rows, spot, pcr, max_pain)
-        col = sig_color(signal)
+        col  = sig_color(signal)
         mp_pct = (spot - max_pain) / max_pain * 100 if max_pain else 0
 
         st.markdown(
@@ -574,11 +415,11 @@ elif page == "OI Signal":
             unsafe_allow_html=True,
         )
         m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("PCR", f"{pcr:.2f}")
+        m1.metric("PCR",      f"{pcr:.2f}")
         m2.metric("Max Pain", f"${max_pain:.2f}")
         m3.metric("MP Dist%", f"{mp_pct:+.1f}%")
-        m4.metric("CE Wall", f"${ce_wall:.0f}")
-        m5.metric("PE Wall", f"${pe_wall:.0f}")
+        m4.metric("CE Wall",  f"${ce_wall:.0f}")
+        m5.metric("PE Wall",  f"${pe_wall:.0f}")
 
         all_strikes = sorted(set(r["strike"] for r in rows))
         atm = min(all_strikes, key=lambda x: abs(x - spot)) if all_strikes else spot
@@ -592,39 +433,39 @@ elif page == "OI Signal":
             if not c_df.empty:
                 fig.add_bar(x=c_df["strike"], y=c_df["open_interest"], name="Calls OI", marker_color="#3b82f6")
             if not p_df.empty:
-                fig.add_bar(x=p_df["strike"], y=p_df["open_interest"], name="Puts OI", marker_color="#ef4444")
-            fig.add_vline(x=spot, line_dash="dash", line_color="#f59e0b", annotation_text="Spot")
-            fig.add_vline(x=max_pain, line_dash="dot", line_color="#a855f7", annotation_text="MaxPain")
+                fig.add_bar(x=p_df["strike"], y=p_df["open_interest"], name="Puts OI",  marker_color="#ef4444")
+            fig.add_vline(x=spot,     line_dash="dash", line_color="#f59e0b", annotation_text="Spot")
+            fig.add_vline(x=max_pain, line_dash="dot",  line_color="#a855f7", annotation_text="MaxPain")
             fig.update_layout(barmode="group", title="OI by Strike (ATM ±20)",
                               paper_bgcolor="#0f172a", plot_bgcolor="#1e293b",
                               font_color="#94a3b8", height=320)
             st.plotly_chart(fig, use_container_width=True)
 
         st.subheader("Signal Breakdown")
-        st.dataframe(pd.DataFrame(details, columns=["Indicator","Value","Verdict","Explanation"]), use_container_width=True)
+        st.dataframe(pd.DataFrame(details, columns=["Indicator","Value","Verdict","Explanation"]),
+                     use_container_width=True)
 
-        # Trade recommendation
-        is_call   = "CALL" in signal
-        is_strong = "STRONG" in signal
+        is_call    = "CALL"    in signal
+        is_strong  = "STRONG"  in signal
         is_neutral = "NEUTRAL" in signal
         if not is_neutral:
             gaps = [b - a for a, b in zip(all_strikes, all_strikes[1:])]
-            gap = min(gaps) if gaps else 1.0
+            gap  = min(gaps) if gaps else 1.0
             rec_strike = atm if is_strong else (atm + gap if is_call else atm - gap)
-            otype = "CALL" if is_call else "PUT"
-            cands = [r for r in rows if r["option_type"] == otype and abs(r["strike"] - rec_strike) < gap * 0.6]
-            ltp = cands[0]["last"] if cands else 0
-            actual_strike = cands[0]["strike"] if cands else rec_strike
-            sl = round(ltp * 0.65, 2)
+            otype  = "CALL" if is_call else "PUT"
+            cands  = [r for r in rows if r["option_type"] == otype and abs(r["strike"] - rec_strike) < gap * 0.6]
+            ltp    = cands[0]["last"]   if cands else 0
+            actual = cands[0]["strike"] if cands else rec_strike
+            sl     = round(ltp * 0.65, 2)
             target = round(ltp * 1.65, 2)
-            rr = round((target - ltp) / (ltp - sl), 1) if ltp > sl else 0
+            rr     = round((target - ltp) / (ltp - sl), 1) if ltp > sl else 0
             st.subheader("Trade Recommendation")
             t1, t2, t3, t4, t5 = st.columns(5)
-            t1.metric("Strike", f"${actual_strike:.0f}")
-            t2.metric("LTP", f"${ltp:.2f}")
+            t1.metric("Strike",    f"${actual:.0f}")
+            t2.metric("LTP",       f"${ltp:.2f}")
             t3.metric("Stop Loss", f"${sl:.2f}")
-            t4.metric("Target", f"${target:.2f}")
-            t5.metric("R:R", f"{rr:.1f}:1")
+            t4.metric("Target",    f"${target:.2f}")
+            t5.metric("R:R",       f"{rr:.1f}:1")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -668,7 +509,7 @@ elif page == "Expiry Analyzer":
         pcr      = calc_pcr(rows)
         max_pain = calc_max_pain(rows)
         signal, score, details, ce_wall, pe_wall = score_signal(rows, spot, pcr, max_pain)
-        col = sig_color(signal)
+        col    = sig_color(signal)
         mp_pct = (spot - max_pain) / max_pain * 100 if max_pain else 0
 
         if mp_pct < -1.5 and pcr > 1.1:
@@ -676,16 +517,17 @@ elif page == "Expiry Analyzer":
         elif mp_pct > 1.5 and pcr < 0.9:
             st.error("💣 ROCKET DOWN — Spot well above Max Pain with bearish OI.")
 
-        m1, m2, m3, m4, m5, m6 = st.columns(6)
-        m1.metric("Spot", f"${spot:.2f}")
-        m2.metric("Max Pain", f"${max_pain:.2f}")
-        m3.metric("PCR", f"{pcr:.2f}")
-        m4.metric("MP Dist%", f"{mp_pct:+.1f}%")
-        m5.metric("CE Wall", f"${ce_wall:.0f}")
-        m6.metric("PE Wall", f"${pe_wall:.0f}")
+        m1,m2,m3,m4,m5,m6 = st.columns(6)
+        m1.metric("Spot",      f"${spot:.2f}")
+        m2.metric("Max Pain",  f"${max_pain:.2f}")
+        m3.metric("PCR",       f"{pcr:.2f}")
+        m4.metric("MP Dist%",  f"{mp_pct:+.1f}%")
+        m5.metric("CE Wall",   f"${ce_wall:.0f}")
+        m6.metric("PE Wall",   f"${pe_wall:.0f}")
 
         st.markdown(
-            f"""<div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:12px 18px;margin:.6rem 0">
+            f"""<div style="background:#1e293b;border:1px solid #334155;border-radius:10px;
+                            padding:12px 18px;margin:.6rem 0">
               <span style="color:{col};font-size:1.3rem;font-weight:700">{signal}</span>
               &nbsp;&nbsp;<span style="color:#64748b">Score: <b style="color:{col}">{score:+}</b></span>
             </div>""",
@@ -704,16 +546,17 @@ elif page == "Expiry Analyzer":
             if not c_df.empty:
                 fig.add_bar(x=c_df["strike"], y=c_df["open_interest"], name="Calls OI", marker_color="#3b82f6")
             if not p_df.empty:
-                fig.add_bar(x=p_df["strike"], y=p_df["open_interest"], name="Puts OI", marker_color="#ef4444")
-            fig.add_vline(x=spot, line_dash="dash", line_color="#f59e0b", annotation_text="Spot")
-            fig.add_vline(x=max_pain, line_dash="dot", line_color="#a855f7", annotation_text="MaxPain")
+                fig.add_bar(x=p_df["strike"], y=p_df["open_interest"], name="Puts OI",  marker_color="#ef4444")
+            fig.add_vline(x=spot,     line_dash="dash", line_color="#f59e0b", annotation_text="Spot")
+            fig.add_vline(x=max_pain, line_dash="dot",  line_color="#a855f7", annotation_text="MaxPain")
             fig.update_layout(barmode="group", title="OI by Strike",
                               paper_bgcolor="#0f172a", plot_bgcolor="#1e293b",
                               font_color="#94a3b8", height=300)
             st.plotly_chart(fig, use_container_width=True)
 
         st.subheader("Signal Factors")
-        st.dataframe(pd.DataFrame(details, columns=["Indicator","Value","Verdict","Explanation"]), use_container_width=True)
+        st.dataframe(pd.DataFrame(details, columns=["Indicator","Value","Verdict","Explanation"]),
+                     use_container_width=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -733,9 +576,9 @@ elif page == "OI Scanner":
 
     if scan_btn:
         tickers_list = [t.strip().upper() for t in tickers_raw.replace("\n","").split(",") if t.strip()]
-        results = []
+        results  = []
         progress = st.progress(0)
-        status = st.empty()
+        status   = st.empty()
 
         for i, tk in enumerate(tickers_list):
             status.caption(f"Scanning {tk}… ({i+1}/{len(tickers_list)})")
@@ -743,7 +586,7 @@ elif page == "OI Scanner":
             if not exps or offset >= len(exps):
                 progress.progress((i+1)/len(tickers_list))
                 continue
-            expiry = exps[offset]
+            expiry    = exps[offset]
             chain_raw = fetch_option_chain(tk, expiry)
             snap_raw  = fetch_snapshot(tk)
             rows = _parse_chain_rows(chain_raw, expiry)
@@ -758,15 +601,14 @@ elif page == "OI Scanner":
                                  "score":score,"signal":sig,"ce_wall":ce_wall,"pe_wall":pe_wall})
             progress.progress((i+1)/len(tickers_list))
 
-        status.empty()
-        progress.empty()
+        status.empty(); progress.empty()
 
         if not results:
             st.warning("No results.")
         else:
             results.sort(key=lambda r: abs(r["score"]), reverse=True)
             st.success(f"Scanned {len(tickers_list)} tickers · {len(results)} results")
-            df = pd.DataFrame(results)
+            df  = pd.DataFrame(results)
             fig = px.bar(df, x="ticker", y="score", color="score",
                          color_continuous_scale=["#ef4444","#94a3b8","#22c55e"],
                          range_color=[-6,6], title="OI Score by Ticker")
@@ -775,10 +617,12 @@ elif page == "OI Scanner":
             st.plotly_chart(fig, use_container_width=True)
             display = df.copy()
             display["signal"] = display["signal"].str.replace(r" 📈| 📉| ⚖️","", regex=True)
-            st.dataframe(display.rename(columns={"ce_wall":"CE Wall","pe_wall":"PE Wall"})
-                         .style.format({"spot":"${:.2f}","pcr":"{:.2f}","max_pain":"${:.2f}",
-                                        "mp_dist_pct":"{:+.1f}%","CE Wall":"${:.0f}","PE Wall":"${:.0f}"}),
-                         use_container_width=True)
+            st.dataframe(
+                display.rename(columns={"ce_wall":"CE Wall","pe_wall":"PE Wall"})
+                       .style.format({"spot":"${:.2f}","pcr":"{:.2f}","max_pain":"${:.2f}",
+                                      "mp_dist_pct":"{:+.1f}%","CE Wall":"${:.0f}","PE Wall":"${:.0f}"}),
+                use_container_width=True,
+            )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -813,31 +657,30 @@ elif page == "Smart Signal":
                 max_pain = calc_max_pain(rows)
                 sig, score, _, ce_wall, pe_wall = score_signal(rows, spot, pcr, max_pain)
                 mp_pct = (spot - max_pain) / max_pain * 100 if max_pain else 0
-                ce_oi  = sum(r.get("open_interest",0) for r in rows if r["option_type"]=="CALL")
-                pe_oi  = sum(r.get("open_interest",0) for r in rows if r["option_type"]=="PUT")
+                ce_oi  = sum(r["open_interest"] for r in rows if r["option_type"]=="CALL")
+                pe_oi  = sum(r["open_interest"] for r in rows if r["option_type"]=="PUT")
                 results.append({"expiry":expiry,"pcr":pcr,"max_pain":max_pain,"signal":sig,
                                  "score":score,"ce_wall":ce_wall,"pe_wall":pe_wall,
                                  "mp_dist_pct":mp_pct,"ce_oi_k":ce_oi/1000,"pe_oi_k":pe_oi/1000})
             progress.progress((i+1)/len(scan_exps))
 
-        status.empty()
-        progress.empty()
+        status.empty(); progress.empty()
 
         if not results:
             st.warning("No data returned.")
             st.stop()
 
         best = max(results, key=lambda r: abs(r["score"]))
-        col = sig_color(best["signal"])
+        col  = sig_color(best["signal"])
         st.markdown(
             f"""<div style="background:rgba(99,102,241,0.1);border:1px solid #6366f1;
                             border-radius:12px;padding:14px 20px;margin-bottom:1rem">
               <div style="font-size:0.7rem;color:#818cf8;text-transform:uppercase;letter-spacing:.1em">Strongest Signal</div>
               <div style="font-size:1.5rem;font-weight:700;color:{col}">{best['signal']}</div>
               <div style="font-size:0.85rem;color:#94a3b8;margin-top:4px">
-                Expiry: <b style="color:#fff">{best['expiry']}</b> &nbsp;·&nbsp;
-                Score: <b style="color:{col}">{best['score']:+}</b> &nbsp;·&nbsp;
-                PCR: {best['pcr']:.2f} &nbsp;·&nbsp; Max Pain: ${best['max_pain']:.2f}
+                Expiry <b style="color:#fff">{best['expiry']}</b> &nbsp;·&nbsp;
+                Score <b style="color:{col}">{best['score']:+}</b> &nbsp;·&nbsp;
+                PCR {best['pcr']:.2f} &nbsp;·&nbsp; Max Pain ${best['max_pain']:.2f}
               </div>
             </div>""",
             unsafe_allow_html=True,
