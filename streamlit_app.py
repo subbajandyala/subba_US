@@ -76,21 +76,27 @@ def _load_pk():
     return Ed25519PrivateKey.from_private_bytes(base64.b64decode(pem))
 
 
-def _auth_headers(params: dict = None) -> dict:
-    """Build AppKey authentication headers for one request."""
-    ts    = str(int(time.time()))
-    nonce = _sec.token_hex(8)
-    # Canonical string to sign
-    parts = [APP_KEY_ID, ts, nonce]
+def _auth_headers(method: str, full_path: str, params: dict = None) -> dict:
+    """Build AppKey authentication headers (separate X-* headers, ms timestamp).
+
+    Canonical string: {timestamp_ms}\n{METHOD}\n{path}\n{query_string}\n{body}
+    """
+    ts_ms = str(int(time.time() * 1000))  # milliseconds
+    nonce = _sec.token_hex(16)
+    qs = ""
     if params:
-        qs = "&".join(f"{k}={urllib.parse.quote(str(v), safe='')}"
-                      for k, v in sorted(params.items()))
-        parts.append(qs)
-    message   = "\n".join(parts).encode()
-    signature = _load_pk().sign(message)
+        qs = "&".join(
+            f"{k}={urllib.parse.quote(str(v), safe='')}"
+            for k, v in sorted(params.items())
+        )
+    canonical = f"{ts_ms}\n{method}\n{full_path}\n{qs}\n"
+    signature = _load_pk().sign(canonical.encode())
     sig_b64   = base64.b64encode(signature).decode()
     return {
-        "Authorization": f"AppKey {APP_KEY_ID}:{ts}:{nonce}:{sig_b64}",
+        "X-Api-Key":     APP_KEY_ID,
+        "X-Timestamp":   ts_ms,
+        "X-Nonce":       nonce,
+        "Authorization": sig_b64,
         "Content-Type":  "application/json",
     }
 
@@ -98,11 +104,21 @@ def _auth_headers(params: dict = None) -> dict:
 # ── REST helpers ──────────────────────────────────────────────────────────────
 
 def _get(path: str, params: dict = None, timeout: int = 30):
+    # Build URL with sorted params so canonical query string matches actual URL
+    base_url  = f"{MOOMOO_API}{path}"
+    full_path = f"/api/v1.0{path}"
+    if params:
+        qs  = "&".join(
+            f"{k}={urllib.parse.quote(str(v), safe='')}"
+            for k, v in sorted(params.items())
+        )
+        url = f"{base_url}?{qs}"
+    else:
+        url = base_url
     try:
         r = requests.get(
-            f"{MOOMOO_API}{path}",
-            headers=_auth_headers(params),
-            params=params,
+            url,
+            headers=_auth_headers("GET", full_path, params),
             timeout=timeout,
         )
         if not r.ok:
