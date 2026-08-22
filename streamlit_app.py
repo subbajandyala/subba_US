@@ -93,97 +93,82 @@ if not CLIENT_ID:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# OAUTH LOGIN
+# OAUTH LOGIN  (pure server-side PKCE — no browser JS, no CORS issues)
 # ════════════════════════════════════════════════════════════════════════════
 
-try:
-    from streamlit_oauth import OAuth2Component
-    _HAS_OAUTH_PKG = True
-except ImportError:
-    _HAS_OAUTH_PKG = False
+import hashlib, base64, secrets as _secrets, urllib.parse
 
 
-def _manual_oauth_button():
-    """Fallback: show auth link manually when streamlit-oauth is unavailable."""
-    import hashlib, base64, secrets, urllib.parse
-
+def _init_pkce():
     if "pkce_verifier" not in st.session_state:
-        verifier = secrets.token_urlsafe(64)
+        verifier  = _secrets.token_urlsafe(64)
         challenge = base64.urlsafe_b64encode(
             hashlib.sha256(verifier.encode()).digest()
         ).rstrip(b"=").decode()
-        st.session_state.pkce_verifier = verifier
+        st.session_state.pkce_verifier  = verifier
         st.session_state.pkce_challenge = challenge
-        st.session_state.oauth_state = secrets.token_urlsafe(16)
+        st.session_state.oauth_state    = _secrets.token_urlsafe(16)
 
+
+def _build_auth_url() -> str:
+    _init_pkce()
     params = {
-        "client_id": CLIENT_ID,
-        "redirect_uri": REDIRECT_URI,
-        "response_type": "code",
-        "scope": "quote trade account",
-        "code_challenge": st.session_state.pkce_challenge,
+        "client_id":             CLIENT_ID,
+        "redirect_uri":          REDIRECT_URI,
+        "response_type":         "code",
+        "scope":                 "trade",
+        "code_challenge":        st.session_state.pkce_challenge,
         "code_challenge_method": "S256",
-        "state": st.session_state.oauth_state,
+        "state":                 st.session_state.oauth_state,
     }
-    auth_url = f"{AUTHORIZE_URL}?{urllib.parse.urlencode(params)}"
-    st.link_button("Login with MooMoo 📈", auth_url, type="primary", use_container_width=False)
+    return f"{AUTHORIZE_URL}?{urllib.parse.urlencode(params)}"
 
-    # Check for callback code in URL
-    qp = st.query_params
-    if "code" in qp:
-        code = qp["code"]
-        state = qp.get("state", "")
-        if state != st.session_state.get("oauth_state", ""):
-            st.error("OAuth state mismatch — possible CSRF. Please try again.")
-            st.session_state.pop("pkce_verifier", None)
-            st.stop()
 
-        with st.spinner("Exchanging code for access token…"):
-            resp = requests.post(TOKEN_URL, json={
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": REDIRECT_URI,
-                "client_id": CLIENT_ID,
-                "code_verifier": st.session_state.pkce_verifier,
-            }, timeout=15)
-
-        if resp.ok:
-            token_data = resp.json()
-            st.session_state.token = token_data
-            st.session_state.token_expires_at = time.time() + token_data.get("expires_in", 7200) - 60
-            st.query_params.clear()
-            st.rerun()
-        else:
-            st.error(f"Token exchange failed: {resp.status_code} {resp.text}")
+def _exchange_code(code: str) -> bool:
+    """Exchange auth code for token (form-encoded, server-side)."""
+    resp = requests.post(
+        TOKEN_URL,
+        data={
+            "grant_type":    "authorization_code",
+            "code":          code,
+            "redirect_uri":  REDIRECT_URI,
+            "client_id":     CLIENT_ID,
+            "code_verifier": st.session_state.get("pkce_verifier", ""),
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=20,
+    )
+    if resp.ok:
+        td = resp.json()
+        st.session_state.token = td
+        st.session_state.token_expires_at = time.time() + td.get("expires_in", 7200) - 60
+        return True
+    st.error(f"Token exchange failed ({resp.status_code}): {resp.text}")
+    return False
 
 
 if "token" not in st.session_state:
-    st.title("Subba US Options")
-    st.markdown("Real-time MooMoo data — **no local software needed**.")
-    st.divider()
-
-    if _HAS_OAUTH_PKG:
-        oauth2 = OAuth2Component(
-            client_id=CLIENT_ID,
-            client_secret=None,
-            authorize_endpoint=AUTHORIZE_URL,
-            token_endpoint=TOKEN_URL,
-            refresh_token_endpoint=TOKEN_URL,
-            revoke_token_endpoint=None,
-        )
-        result = oauth2.authorize_button(
-            "Login with MooMoo 📈",
-            redirect_uri=REDIRECT_URI,
-            scope="quote trade account",
-            pkce="S256",
-            key="moomoo_login",
-        )
-        if result and "token" in result:
-            st.session_state.token = result["token"]
-            st.session_state.token_expires_at = time.time() + result["token"].get("expires_in", 7200) - 60
-            st.rerun()
+    qp = st.query_params
+    if "code" in qp:
+        # Returned from MooMoo with auth code
+        code  = qp["code"]
+        state = qp.get("state", "")
+        if state and state != st.session_state.get("oauth_state", ""):
+            st.error("OAuth state mismatch — please try again.")
+            for k in ["pkce_verifier", "pkce_challenge", "oauth_state"]:
+                st.session_state.pop(k, None)
+        else:
+            with st.spinner("Logging in…"):
+                ok = _exchange_code(code)
+            if ok:
+                st.query_params.clear()
+                st.rerun()
     else:
-        _manual_oauth_button()
+        st.title("Subba US Options")
+        st.markdown("Real-time MooMoo data — **no local software needed**.")
+        st.divider()
+        auth_url = _build_auth_url()
+        st.link_button("Login with MooMoo 📈", auth_url, type="primary")
 
     st.stop()
 
@@ -194,14 +179,16 @@ def _refresh_token():
     rt = st.session_state.token.get("refresh_token")
     if not rt:
         return
-    resp = requests.post(TOKEN_URL, json={
-        "grant_type": "refresh_token",
-        "refresh_token": rt,
-        "client_id": CLIENT_ID,
-    }, timeout=15)
+    resp = requests.post(
+        TOKEN_URL,
+        data={"grant_type": "refresh_token", "refresh_token": rt, "client_id": CLIENT_ID},
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=15,
+    )
     if resp.ok:
-        st.session_state.token = resp.json()
-        st.session_state.token_expires_at = time.time() + resp.json().get("expires_in", 7200) - 60
+        td = resp.json()
+        st.session_state.token = td
+        st.session_state.token_expires_at = time.time() + td.get("expires_in", 7200) - 60
 
 
 if time.time() > st.session_state.get("token_expires_at", float("inf")):
