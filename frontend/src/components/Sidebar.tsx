@@ -1,15 +1,38 @@
 "use client";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { LayoutDashboard, Activity, TrendingUp, Briefcase, List, ShoppingCart, Settings } from "lucide-react";
+import {
+  LayoutDashboard, Activity, TrendingUp, Briefcase, List, ShoppingCart,
+  BarChart2, Search, Calendar, ScanLine, Zap,
+} from "lucide-react";
 
-const NAV = [
-  { href: "/",         icon: LayoutDashboard, label: "Dashboard" },
-  { href: "/options",  icon: Activity,        label: "Options Chain" },
-  { href: "/quotes",   icon: TrendingUp,      label: "Quotes" },
-  { href: "/positions",icon: Briefcase,       label: "Positions" },
-  { href: "/orders",   icon: List,            label: "Orders" },
-  { href: "/trade",    icon: ShoppingCart,    label: "Trade" },
+const NAV_GROUPS = [
+  {
+    label: "Trading",
+    items: [
+      { href: "/",          icon: LayoutDashboard, label: "Dashboard" },
+      { href: "/options",   icon: Activity,        label: "Options Chain" },
+      { href: "/quotes",    icon: TrendingUp,      label: "Quotes" },
+      { href: "/positions", icon: Briefcase,       label: "Positions" },
+      { href: "/orders",    icon: List,            label: "Orders" },
+      { href: "/trade",     icon: ShoppingCart,    label: "Trade" },
+    ],
+  },
+  {
+    label: "Analytics",
+    items: [
+      { href: "/oi-signal",    icon: BarChart2, label: "OI Signal" },
+      { href: "/expiry",       icon: Calendar,  label: "Expiry Analyzer" },
+      { href: "/smart-signal", icon: Zap,       label: "Smart Signal" },
+      { href: "/scanner",      icon: ScanLine,  label: "OI Scanner" },
+    ],
+  },
+  {
+    label: "Screeners",
+    items: [
+      { href: "/screeners", icon: Search, label: "Screeners" },
+    ],
+  },
 ];
 
 export function Sidebar() {
@@ -29,24 +52,31 @@ export function Sidebar() {
       </div>
 
       {/* Nav */}
-      <nav className="flex-1 px-3 py-4 space-y-1">
-        {NAV.map(({ href, icon: Icon, label }) => {
-          const active = path === href || (href !== "/" && path.startsWith(href));
-          return (
-            <Link
-              key={href}
-              href={href}
-              className={`flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors ${
-                active
-                  ? "bg-brand-900/50 text-brand-400 font-medium"
-                  : "text-slate-400 hover:text-slate-200 hover:bg-surface-hover"
-              }`}
-            >
-              <Icon className={`w-4 h-4 ${active ? "text-brand-400" : ""}`} />
-              {label}
-            </Link>
-          );
-        })}
+      <nav className="flex-1 px-3 py-4 space-y-4 overflow-y-auto">
+        {NAV_GROUPS.map(group => (
+          <div key={group.label}>
+            <p className="px-3 mb-1 text-[10px] uppercase tracking-wider text-slate-600 font-semibold">{group.label}</p>
+            <div className="space-y-0.5">
+              {group.items.map(({ href, icon: Icon, label }) => {
+                const active = path === href || (href !== "/" && path.startsWith(href));
+                return (
+                  <Link
+                    key={href}
+                    href={href}
+                    className={`flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors ${
+                      active
+                        ? "bg-brand-900/50 text-brand-400 font-medium"
+                        : "text-slate-400 hover:text-slate-200 hover:bg-surface-hover"
+                    }`}
+                  >
+                    <Icon className={`w-4 h-4 flex-shrink-0 ${active ? "text-brand-400" : ""}`} />
+                    {label}
+                  </Link>
+                );
+              })}
+            </div>
+          </div>
+        ))}
       </nav>
 
       {/* Footer */}

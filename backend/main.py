@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
 
-from routers import quotes, options, account, trading
+from routers import quotes, options, account, trading, analysis, screener, expiry, scanner
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
@@ -39,7 +39,11 @@ app.add_middleware(
 app.include_router(quotes.router, prefix="/api/quotes", tags=["Quotes"])
 app.include_router(options.router, prefix="/api/options", tags=["Options"])
 app.include_router(account.router, prefix="/api/account", tags=["Account"])
-app.include_router(trading.router, prefix="/api/trading", tags=["Trading"])
+app.include_router(trading.router,   prefix="/api/trading",  tags=["Trading"])
+app.include_router(analysis.router,  prefix="/api/options",  tags=["Analysis"])
+app.include_router(screener.router,  prefix="/api/screener", tags=["Screener"])
+app.include_router(expiry.router,    prefix="/api/expiry",   tags=["Expiry"])
+app.include_router(scanner.router,   prefix="/api/scanner",  tags=["Scanner"])
 
 
 @app.get("/health")
