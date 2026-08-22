@@ -99,42 +99,35 @@ if not CLIENT_ID:
 import hashlib, base64, secrets as _secrets, urllib.parse
 
 
-def _init_pkce():
-    if "pkce_verifier" not in st.session_state:
-        verifier  = _secrets.token_urlsafe(64)
-        challenge = base64.urlsafe_b64encode(
-            hashlib.sha256(verifier.encode()).digest()
-        ).rstrip(b"=").decode()
-        st.session_state.pkce_verifier  = verifier
-        st.session_state.pkce_challenge = challenge
-        st.session_state.oauth_state    = _secrets.token_urlsafe(16)
+CLIENT_SECRET = _secret("MOOMOO_CLIENT_SECRET", "")
 
 
 def _build_auth_url() -> str:
-    _init_pkce()
+    if "oauth_state" not in st.session_state:
+        st.session_state.oauth_state = _secrets.token_urlsafe(16)
     params = {
-        "client_id":             CLIENT_ID,
-        "redirect_uri":          REDIRECT_URI,
-        "response_type":         "code",
-        "scope":                 "trade",
-        "code_challenge":        st.session_state.pkce_challenge,
-        "code_challenge_method": "S256",
-        "state":                 st.session_state.oauth_state,
+        "client_id":     CLIENT_ID,
+        "redirect_uri":  REDIRECT_URI,
+        "response_type": "code",
+        "state":         st.session_state.oauth_state,
     }
     return f"{AUTHORIZE_URL}?{urllib.parse.urlencode(params)}"
 
 
 def _exchange_code(code: str) -> bool:
     """Exchange auth code for token (form-encoded, server-side)."""
+    payload = {
+        "grant_type":   "authorization_code",
+        "code":         code,
+        "redirect_uri": REDIRECT_URI,
+        "client_id":    CLIENT_ID,
+    }
+    if CLIENT_SECRET:
+        payload["client_secret"] = CLIENT_SECRET
+
     resp = requests.post(
         TOKEN_URL,
-        data={
-            "grant_type":    "authorization_code",
-            "code":          code,
-            "redirect_uri":  REDIRECT_URI,
-            "client_id":     CLIENT_ID,
-            "code_verifier": st.session_state.get("pkce_verifier", ""),
-        },
+        data=payload,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         timeout=20,
     )
@@ -143,32 +136,38 @@ def _exchange_code(code: str) -> bool:
         st.session_state.token = td
         st.session_state.token_expires_at = time.time() + td.get("expires_in", 7200) - 60
         return True
-    st.error(f"Token exchange failed ({resp.status_code}): {resp.text}")
+    st.error(f"Token exchange failed ({resp.status_code})")
+    with st.expander("Error detail"):
+        st.code(resp.text)
     return False
 
 
 if "token" not in st.session_state:
     qp = st.query_params
+    if "error" in qp:
+        st.error(f"MooMoo returned error: **{qp['error']}** — {qp.get('error_description', '')}")
+        if st.button("Try again"):
+            st.query_params.clear()
+            st.rerun()
+        st.stop()
+
     if "code" in qp:
-        # Returned from MooMoo with auth code
-        code  = qp["code"]
-        state = qp.get("state", "")
-        if state and state != st.session_state.get("oauth_state", ""):
-            st.error("OAuth state mismatch — please try again.")
-            for k in ["pkce_verifier", "pkce_challenge", "oauth_state"]:
-                st.session_state.pop(k, None)
+        with st.spinner("Logging in…"):
+            ok = _exchange_code(qp["code"])
+        if ok:
+            st.query_params.clear()
+            st.rerun()
         else:
-            with st.spinner("Logging in…"):
-                ok = _exchange_code(code)
-            if ok:
+            if st.button("Try again"):
                 st.query_params.clear()
                 st.rerun()
-    else:
-        st.title("Subba US Options")
-        st.markdown("Real-time MooMoo data — **no local software needed**.")
-        st.divider()
-        auth_url = _build_auth_url()
-        st.link_button("Login with MooMoo 📈", auth_url, type="primary")
+        st.stop()
+
+    st.title("Subba US Options")
+    st.markdown("Real-time MooMoo data — **no local software needed**.")
+    st.divider()
+    auth_url = _build_auth_url()
+    st.link_button("Login with MooMoo 📈", auth_url, type="primary")
 
     st.stop()
 
@@ -179,9 +178,12 @@ def _refresh_token():
     rt = st.session_state.token.get("refresh_token")
     if not rt:
         return
+    payload = {"grant_type": "refresh_token", "refresh_token": rt, "client_id": CLIENT_ID}
+    if CLIENT_SECRET:
+        payload["client_secret"] = CLIENT_SECRET
     resp = requests.post(
         TOKEN_URL,
-        data={"grant_type": "refresh_token", "refresh_token": rt, "client_id": CLIENT_ID},
+        data=payload,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         timeout=15,
     )
