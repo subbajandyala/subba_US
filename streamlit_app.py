@@ -72,26 +72,35 @@ def _load_pk():
     pem = PRIVATE_KEY_PEM.strip()
     if pem.startswith("-----"):
         return load_pem_private_key(pem.encode(), password=None)
-    # raw base64 seed (32 bytes)
     return Ed25519PrivateKey.from_private_bytes(base64.b64decode(pem))
 
 
-def _auth_headers(method: str, full_path: str, params: dict = None) -> dict:
-    """Build AppKey authentication headers (separate X-* headers, ms timestamp).
+_srv_time_offset_ms: int = 0   # adjusted once on first successful call
 
-    Canonical string: {timestamp_ms}\n{METHOD}\n{path}\n{query_string}\n{body}
-    """
-    ts_ms = str(int(time.time() * 1000))  # milliseconds
+def _synced_ts_ms() -> str:
+    """Return current millisecond timestamp, adjusted for server-time offset."""
+    return str(int(time.time() * 1000) + _srv_time_offset_ms)
+
+
+def _build_qs(params: dict) -> str:
+    if not params:
+        return ""
+    return "&".join(
+        f"{k}={urllib.parse.quote(str(v), safe='')}"
+        for k, v in sorted(params.items())
+    )
+
+
+def _sign_request(method: str, canonical_path: str, qs: str) -> tuple[str, str, str, str]:
+    """Returns (ts_ms, nonce, sig_b64, canonical) for a request."""
+    ts_ms = _synced_ts_ms()
     nonce = _sec.token_hex(16)
-    qs = ""
-    if params:
-        qs = "&".join(
-            f"{k}={urllib.parse.quote(str(v), safe='')}"
-            for k, v in sorted(params.items())
-        )
-    canonical = f"{ts_ms}\n{method}\n{full_path}\n{qs}\n"
-    signature = _load_pk().sign(canonical.encode())
-    sig_b64   = base64.b64encode(signature).decode()
+    canonical = f"{ts_ms}\n{method}\n{canonical_path}\n{qs}\n"
+    sig_b64 = base64.b64encode(_load_pk().sign(canonical.encode())).decode()
+    return ts_ms, nonce, sig_b64, canonical
+
+
+def _make_headers(ts_ms: str, nonce: str, sig_b64: str) -> dict:
     return {
         "X-Api-Key":     APP_KEY_ID,
         "X-Timestamp":   ts_ms,
@@ -103,33 +112,66 @@ def _auth_headers(method: str, full_path: str, params: dict = None) -> dict:
 
 # ── REST helpers ──────────────────────────────────────────────────────────────
 
-def _get(path: str, params: dict = None, timeout: int = 30):
-    # Build URL with sorted params so canonical query string matches actual URL
-    base_url  = f"{MOOMOO_API}{path}"
-    full_path = f"/api/v1.0{path}"
-    if params:
-        qs  = "&".join(
-            f"{k}={urllib.parse.quote(str(v), safe='')}"
-            for k, v in sorted(params.items())
-        )
-        url = f"{base_url}?{qs}"
-    else:
-        url = base_url
+def _try_sync_server_time():
+    """One-shot attempt to sync local clock to MooMoo server time (no auth needed)."""
+    global _srv_time_offset_ms
     try:
-        r = requests.get(
-            url,
-            headers=_auth_headers("GET", full_path, params),
-            timeout=timeout,
-        )
-        if not r.ok:
+        r = requests.get(f"{MOOMOO_API}/server-time", timeout=5)
+        if r.ok:
+            d = r.json()
+            srv = d.get("data") or d
+            # field may be "server_time", "timestamp", "time", or "serverTime"
+            for key in ("server_time", "serverTime", "timestamp", "time"):
+                if key in srv:
+                    _srv_time_offset_ms = int(srv[key]) - int(time.time() * 1000)
+                    break
+    except Exception:
+        pass
+
+
+_try_sync_server_time()   # run once at module load
+
+
+def _get(path: str, params: dict = None, timeout: int = 30):
+    """GET request to MooMoo REST API with AppKey Ed25519 auth.
+
+    Tries two canonical-path variants:
+      1. Full URL path:  /api/v1.0{path}
+      2. Endpoint only:  {path}   (e.g. /quote/option-expiration-date)
+    """
+    qs      = _build_qs(params)
+    url     = f"{MOOMOO_API}{path}" + (f"?{qs}" if qs else "")
+
+    for canonical_path in (f"/api/v1.0{path}", path):
+        ts_ms, nonce, sig_b64, canonical = _sign_request("GET", canonical_path, qs)
+        try:
+            r = requests.get(url, headers=_make_headers(ts_ms, nonce, sig_b64),
+                             timeout=timeout)
+            if r.ok:
+                return r.json()
+            body = r.text
+            # -12006 = invalid signature — try other path variant before giving up
+            try:
+                code = r.json().get("code", 0)
+            except Exception:
+                code = 0
+            if code == -12006 and canonical_path == f"/api/v1.0{path}":
+                continue   # retry with shorter path
+            # permanent failure — surface it
             st.error(f"API {path} → {r.status_code}")
             with st.expander("Error detail"):
-                st.code(r.text)
+                st.code(body)
+                st.caption(f"Canonical path tried: `{canonical_path}`")
+                st.caption(f"Canonical string:\n```\n{canonical}```")
+                st.caption(f"Server-time offset: {_srv_time_offset_ms} ms")
             return None
-        return r.json()
-    except requests.RequestException as e:
-        st.error(f"Network error {path}: {e}")
-        return None
+        except requests.RequestException as e:
+            st.error(f"Network error {path}: {e}")
+            return None
+
+    # both variants failed
+    st.error(f"API {path} → auth failed (both path variants tried)")
+    return None
 
 
 def us(ticker: str) -> str:
