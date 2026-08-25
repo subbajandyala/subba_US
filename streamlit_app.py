@@ -137,7 +137,7 @@ def _get(path: str, params: dict = None, timeout: int = 30):
 
     Tries two canonical-path variants:
       1. Full URL path:  /api/v1.0{path}
-      2. Endpoint only:  {path}   (e.g. /quote/option-expiration-date)
+      2. Endpoint only:  {path}   (e.g. /quote/option_expiration_date)
     """
     qs      = _build_qs(params)
     url     = f"{MOOMOO_API}{path}" + (f"?{qs}" if qs else "")
@@ -184,12 +184,12 @@ def us(ticker: str) -> str:
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_snapshot(tickers_csv: str):
     code_list = ",".join(us(t.strip()) for t in tickers_csv.split(",") if t.strip())
-    return _get("/quote/market-snapshot", {"code_list": code_list})
+    return _get("/quote/market_snapshot", {"code_list": code_list})
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_expirations(ticker: str):
-    data = _get("/quote/option-expiration-date", {"code": us(ticker)})
+    data = _get("/quote/option_expiration_date", {"code": us(ticker)})
     if data and "data" in data:
         return data["data"].get("option_expiration_date_list", [])
     return []
@@ -197,7 +197,7 @@ def fetch_expirations(ticker: str):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_option_chain(ticker: str, expiry: str):
-    return _get("/quote/option-chain", {
+    return _get("/quote/option_chain", {
         "code": us(ticker),
         "start_strike_time": expiry,
         "end_strike_time":   expiry,
