@@ -91,7 +91,7 @@ def _build_qs(params: dict) -> str:
     )
 
 
-def _sign_request(method: str, canonical_path: str, qs: str) -> tuple[str, str, str, str]:
+def _sign_request(method: str, canonical_path: str, qs: str):
     """Returns (ts_ms, nonce, sig_b64, canonical) for a request."""
     ts_ms = _synced_ts_ms()
     nonce = _sec.token_hex(16)
