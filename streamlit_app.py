@@ -109,13 +109,19 @@ def _get(path, params=None, timeout=30):
         return None
 
     if r.ok:
-        return r.json()
+        j = r.json()
+        rc = j.get("ret_code", 0) if isinstance(j, dict) else 0
+        if rc != 0:
+            st.error("API {} → ret_code {} — {}".format(path, rc, j.get("ret_msg", "")))
+            with st.expander("Error detail"):
+                st.json(j)
+            return None
+        return j
 
-    # Show error details to help diagnose
     st.error("API {} → {}".format(path, r.status_code))
     with st.expander("Error detail"):
         st.code(r.text)
-        st.caption("Canonical path used: `/api/v1.0{}`".format(path))
+        st.caption("Canonical path: `/api/v1.0{}`".format(path))
         st.caption("Canonical string:\n```\n{}```".format(canonical))
     return None
 
@@ -130,7 +136,7 @@ def us(ticker: str) -> str:
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_snapshot(tickers_csv):
     code_list = ",".join(us(t.strip()) for t in tickers_csv.split(",") if t.strip())
-    return _get("/quote/market_snapshot", {"code_list": code_list})
+    return _get("/quote/stock_quote", {"code_list": code_list})
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -191,9 +197,11 @@ def _parse_chain_rows(chain_data, expiry: str):
 def _spot_from_snapshot(snap_data, ticker: str) -> float:
     if not snap_data or "data" not in snap_data:
         return 0.0
-    for item in snap_data.get("data", {}).get("snapshot_list", []):
+    d = snap_data["data"]
+    items = d.get("quote_list") or d.get("snapshot_list") or []
+    for item in items:
         if us(ticker) in item.get("code", ""):
-            return float(item.get("last_price", 0))
+            return float(item.get("last_price", 0) or item.get("cur_price", 0))
     return 0.0
 
 
@@ -296,13 +304,14 @@ if page == "Dashboard":
         snap = fetch_snapshot(tickers_in)
 
     if snap and "data" in snap:
-        snap_list = snap["data"].get("snapshot_list", [])
+        d = snap["data"]
+        snap_list = d.get("quote_list") or d.get("snapshot_list") or []
         if snap_list:
             cols = st.columns(4)
             for i, item in enumerate(snap_list):
                 code = str(item.get("code", "")).replace("US.", "")
-                last = float(item.get("last_price", 0))
-                chg  = float(item.get("change_rate", 0))
+                last = float(item.get("last_price", 0) or item.get("cur_price", 0))
+                chg  = float(item.get("change_rate", 0) or item.get("change_val", 0))
                 cols[i % 4].metric(code, f"${last:.2f}", delta=f"{chg:+.2f}%", delta_color="normal")
         else:
             st.info("No snapshot data returned.")
