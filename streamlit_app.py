@@ -75,102 +75,48 @@ def _load_pk():
     return Ed25519PrivateKey.from_private_bytes(base64.b64decode(pem))
 
 
-_srv_time_offset_ms: int = 0   # adjusted once on first successful call
-
-def _synced_ts_ms() -> str:
-    """Return current millisecond timestamp, adjusted for server-time offset."""
-    return str(int(time.time() * 1000) + _srv_time_offset_ms)
-
-
-def _build_qs(params: dict) -> str:
-    if not params:
-        return ""
-    return "&".join(
-        f"{k}={urllib.parse.quote(str(v), safe='')}"
-        for k, v in sorted(params.items())
-    )
-
-
-def _sign_request(method: str, canonical_path: str, qs: str):
-    """Returns (ts_ms, nonce, sig_b64, canonical) for a request."""
-    ts_ms = _synced_ts_ms()
+def _auth_headers(path, params=None):
+    """Return headers for one AppKey-authenticated GET request."""
+    ts_ms = str(int(time.time() * 1000))
     nonce = _sec.token_hex(16)
-    canonical = f"{ts_ms}\n{method}\n{canonical_path}\n{qs}\n"
-    sig_b64 = base64.b64encode(_load_pk().sign(canonical.encode())).decode()
-    return ts_ms, nonce, sig_b64, canonical
-
-
-def _make_headers(ts_ms: str, nonce: str, sig_b64: str) -> dict:
+    qs = ""
+    if params:
+        qs = "&".join(
+            "{}={}".format(k, urllib.parse.quote(str(v), safe=""))
+            for k, v in sorted(params.items())
+        )
+    # canonical: timestamp_ms \n METHOD \n /api/v1.0/path \n query_string \n body
+    canonical = "{}\nGET\n/api/v1.0{}\n{}\n".format(ts_ms, path, qs)
+    sig = base64.b64encode(_load_pk().sign(canonical.encode())).decode()
     return {
         "X-Api-Key":     APP_KEY_ID,
         "X-Timestamp":   ts_ms,
         "X-Nonce":       nonce,
-        "Authorization": sig_b64,
+        "Authorization": sig,
         "Content-Type":  "application/json",
-    }
+    }, qs, canonical
 
 
 # ── REST helpers ──────────────────────────────────────────────────────────────
 
-def _try_sync_server_time():
-    """One-shot attempt to sync local clock to MooMoo server time (no auth needed)."""
-    global _srv_time_offset_ms
+def _get(path, params=None, timeout=30):
+    headers, qs, canonical = _auth_headers(path, params)
+    url = "{}{}".format(MOOMOO_API, path) + ("?{}".format(qs) if qs else "")
     try:
-        r = requests.get(f"{MOOMOO_API}/server-time", timeout=5)
-        if r.ok:
-            d = r.json()
-            srv = d.get("data") or d
-            # field may be "server_time", "timestamp", "time", or "serverTime"
-            for key in ("server_time", "serverTime", "timestamp", "time"):
-                if key in srv:
-                    _srv_time_offset_ms = int(srv[key]) - int(time.time() * 1000)
-                    break
-    except Exception:
-        pass
+        r = requests.get(url, headers=headers, timeout=timeout)
+    except requests.RequestException as exc:
+        st.error("Network error {}: {}".format(path, exc))
+        return None
 
+    if r.ok:
+        return r.json()
 
-_try_sync_server_time()   # run once at module load
-
-
-def _get(path: str, params: dict = None, timeout: int = 30):
-    """GET request to MooMoo REST API with AppKey Ed25519 auth.
-
-    Tries two canonical-path variants:
-      1. Full URL path:  /api/v1.0{path}
-      2. Endpoint only:  {path}   (e.g. /quote/option_expiration_date)
-    """
-    qs      = _build_qs(params)
-    url     = f"{MOOMOO_API}{path}" + (f"?{qs}" if qs else "")
-
-    for canonical_path in (f"/api/v1.0{path}", path):
-        ts_ms, nonce, sig_b64, canonical = _sign_request("GET", canonical_path, qs)
-        try:
-            r = requests.get(url, headers=_make_headers(ts_ms, nonce, sig_b64),
-                             timeout=timeout)
-            if r.ok:
-                return r.json()
-            body = r.text
-            # -12006 = invalid signature — try other path variant before giving up
-            try:
-                code = r.json().get("code", 0)
-            except Exception:
-                code = 0
-            if code == -12006 and canonical_path == f"/api/v1.0{path}":
-                continue   # retry with shorter path
-            # permanent failure — surface it
-            st.error(f"API {path} → {r.status_code}")
-            with st.expander("Error detail"):
-                st.code(body)
-                st.caption(f"Canonical path tried: `{canonical_path}`")
-                st.caption(f"Canonical string:\n```\n{canonical}```")
-                st.caption(f"Server-time offset: {_srv_time_offset_ms} ms")
-            return None
-        except requests.RequestException as e:
-            st.error(f"Network error {path}: {e}")
-            return None
-
-    # both variants failed
-    st.error(f"API {path} → auth failed (both path variants tried)")
+    # Show error details to help diagnose
+    st.error("API {} → {}".format(path, r.status_code))
+    with st.expander("Error detail"):
+        st.code(r.text)
+        st.caption("Canonical path used: `/api/v1.0{}`".format(path))
+        st.caption("Canonical string:\n```\n{}```".format(canonical))
     return None
 
 
@@ -182,21 +128,30 @@ def us(ticker: str) -> str:
 # ── Cached data ───────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_snapshot(tickers_csv: str):
+def fetch_snapshot(tickers_csv):
     code_list = ",".join(us(t.strip()) for t in tickers_csv.split(",") if t.strip())
     return _get("/quote/market_snapshot", {"code_list": code_list})
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_expirations(ticker: str):
+def fetch_expirations(ticker):
     data = _get("/quote/option_expiration_date", {"code": us(ticker)})
-    if data and "data" in data:
-        return data["data"].get("option_expiration_date_list", [])
-    return []
+    if not data or "data" not in data:
+        return []
+    d = data["data"]
+    # REST API returns expiration_list with strike_time fields
+    lst = d.get("expiration_list") or d.get("option_expiration_date_list") or []
+    dates = []
+    for item in lst:
+        if isinstance(item, dict):
+            dates.append(item.get("strike_time") or item.get("date") or "")
+        elif isinstance(item, str):
+            dates.append(item)
+    return [x for x in dates if x]
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_option_chain(ticker: str, expiry: str):
+def fetch_option_chain(ticker, expiry):
     return _get("/quote/option_chain", {
         "code": us(ticker),
         "start_strike_time": expiry,
