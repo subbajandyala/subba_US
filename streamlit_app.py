@@ -40,9 +40,10 @@ MOOMOO_API = "https://webapi.moomoo.com/api/v1.0"
 # ── Secrets ───────────────────────────────────────────────────────────────────
 
 def _secret(key: str, default: str = "") -> str:
-    if hasattr(st, "secrets") and key in st.secrets:
+    try:
         return str(st.secrets[key])
-    return os.environ.get(key, default)
+    except Exception:
+        return os.environ.get(key, default)
 
 APP_KEY_ID      = _secret("MOOMOO_APP_KEY_ID")
 PRIVATE_KEY_PEM = _secret("MOOMOO_PRIVATE_KEY")
