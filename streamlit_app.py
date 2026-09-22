@@ -139,58 +139,96 @@ def fetch_snapshot(tickers_csv):
     return _get("/quote/stock_quote", {"code_list": code_list})
 
 
+def _to_ymd(date_str):
+    """Normalise any date/datetime/timestamp string to YYYY-MM-DD."""
+    s = str(date_str).strip()
+    if len(s) >= 10 and s[4] == "-":
+        return s[:10]
+    return s
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_expirations(ticker):
     data = _get("/quote/option_expiration_date", {"code": us(ticker)})
     if not data or "data" not in data:
         return []
     d = data["data"]
-    # REST API returns expiration_list with strike_time fields
     lst = d.get("expiration_list") or d.get("option_expiration_date_list") or []
     dates = []
     for item in lst:
         if isinstance(item, dict):
-            dates.append(item.get("strike_time") or item.get("date") or "")
+            raw = item.get("strike_time") or item.get("date") or ""
         elif isinstance(item, str):
-            dates.append(item)
+            raw = item
+        else:
+            raw = ""
+        if raw:
+            dates.append(_to_ymd(raw))
     return [x for x in dates if x]
 
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_option_chain(ticker, expiry):
+    # REST API uses start/end (yyyy-MM-dd) matching the MCP tool date format
     return _get("/quote/option_chain", {
-        "code": us(ticker),
-        "start_strike_time": expiry,
-        "end_strike_time":   expiry,
+        "code":  us(ticker),
+        "start": expiry,
+        "end":   expiry,
     }, timeout=60)
+
+
+def _contract_row(opt, option_type_str):
+    try:
+        return {
+            "code":          opt.get("code", ""),
+            "strike":        float(opt.get("strike_price", 0) or 0),
+            "option_type":   option_type_str,
+            "last":          float(opt.get("last_price",        0) or 0),
+            "bid":           float(opt.get("bid_price",         0) or 0),
+            "ask":           float(opt.get("ask_price",         0) or 0),
+            "open_interest": int(opt.get("open_interest",       0) or 0),
+            "volume":        int(opt.get("volume",              0) or 0),
+            "iv":            float(opt.get("implied_volatility", 0) or 0),
+            "delta":         float(opt.get("delta",             0) or 0),
+            "gamma":         float(opt.get("gamma",             0) or 0),
+            "theta":         float(opt.get("theta",             0) or 0),
+        }
+    except (TypeError, ValueError):
+        return None
 
 
 def _parse_chain_rows(chain_data, expiry: str):
     if not chain_data or "data" not in chain_data:
         return []
     rows = []
-    for item in chain_data["data"].get("option_chain", []):
-        for opt_type in ["call", "put"]:
-            opts = item.get(opt_type, [])
-            if not isinstance(opts, list):
-                opts = [opts] if opts else []
-            for opt in opts:
-                if not opt:
-                    continue
-                rows.append({
-                    "code":          opt.get("code", ""),
-                    "strike":        float(opt.get("strike_price", 0)),
-                    "option_type":   "CALL" if opt_type == "call" else "PUT",
-                    "last":          float(opt.get("last_price",        0)),
-                    "bid":           float(opt.get("bid_price",         0)),
-                    "ask":           float(opt.get("ask_price",         0)),
-                    "open_interest": int(opt.get("open_interest",       0)),
-                    "volume":        int(opt.get("volume",              0)),
-                    "iv":            float(opt.get("implied_volatility", 0)),
-                    "delta":         float(opt.get("delta",             0)),
-                    "gamma":         float(opt.get("gamma",             0)),
-                    "theta":         float(opt.get("theta",             0)),
-                })
+    items = chain_data["data"].get("option_chain", [])
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        # Flat structure: each item is one CALL or PUT contract
+        if "option_type" in item or "type" in item:
+            raw_type = item.get("option_type") or item.get("type", 0)
+            # 1=CALL, 2=PUT; or string "CALL"/"PUT"/"call"/"put"
+            if str(raw_type) in ("1", "CALL", "call"):
+                otype = "CALL"
+            elif str(raw_type) in ("2", "PUT", "put"):
+                otype = "PUT"
+            else:
+                continue
+            row = _contract_row(item, otype)
+            if row:
+                rows.append(row)
+        else:
+            # Nested structure: item has "call" and/or "put" sub-lists
+            for key, label in [("call", "CALL"), ("put", "PUT")]:
+                opts = item.get(key, [])
+                if not isinstance(opts, list):
+                    opts = [opts] if opts else []
+                for opt in opts:
+                    if opt:
+                        row = _contract_row(opt, label)
+                        if row:
+                            rows.append(row)
     return rows
 
 

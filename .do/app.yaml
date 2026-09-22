@@ -1,0 +1,21 @@
+name: subba-us-options
+region: nyc
+
+services:
+  - name: web
+    github:
+      repo: subbajandyala/subba_US
+      branch: main            # change to your deployment branch
+      deploy_on_push: true
+    dockerfile_path: Dockerfile
+    instance_count: 1
+    instance_size_slug: basic-xxs   # $5/mo — upgrade if needed
+    envs:
+      - key: MOOMOO_APP_KEY_ID
+        scope: RUN_AND_BUILD_TIME
+        value: "2262a22a2faaf381a2e740db195e4864"
+      - key: MOOMOO_PRIVATE_KEY
+        scope: RUN_TIME
+        type: SECRET
+        # Set this in the DO App Platform console → Settings → Environment Variables
+        # Paste your Ed25519 PEM key (-----BEGIN PRIVATE KEY----- ... -----END PRIVATE KEY-----)
