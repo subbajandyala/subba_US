@@ -9,7 +9,7 @@ Streamlit secrets required:
   ...your Ed25519 private key...
   -----END PRIVATE KEY-----\"\"\"
 """
-import os, time, base64, secrets as _sec, urllib.parse
+import os, time, json, base64, hashlib, secrets as _sec, urllib.parse
 import requests
 import pandas as pd
 import plotly.graph_objects as go
@@ -76,74 +76,67 @@ def _load_pk():
     return Ed25519PrivateKey.from_private_bytes(base64.b64decode(pem))
 
 
-def _auth_headers(path, params=None):
-    """Return headers for one AppKey-authenticated GET request."""
+def _signed_headers(method, path, qs, body_bytes):
+    """AppKey signature per open.moomoo.com Getting Started:
+    signing string = timestamp_ms \\n METHOD \\n /api/v1.0/path \\n raw_query \\n sha256_hex(body) (empty if no body)."""
     ts_ms = str(int(time.time() * 1000))
-    nonce = _sec.token_hex(16)
+    body_hash = hashlib.sha256(body_bytes).hexdigest() if body_bytes else ""
+    canonical = "{}\n{}\n/api/v1.0{}\n{}\n{}".format(ts_ms, method, path, qs, body_hash)
+    sig = base64.b64encode(_load_pk().sign(canonical.encode())).decode()
+    return {
+        "X-Api-Key":     APP_KEY_ID,
+        "X-Timestamp":   ts_ms,
+        "X-Nonce":       _sec.token_hex(16),
+        "Authorization": sig,
+        "Content-Type":  "application/json",
+    }, canonical
+
+
+# ── REST helpers ──────────────────────────────────────────────────────────────
+
+def _request(method, path, params=None, body=None, timeout=30, quiet=False):
     qs = ""
     if params:
         qs = "&".join(
             "{}={}".format(k, urllib.parse.quote(str(v), safe=""))
             for k, v in sorted(params.items())
         )
-    # canonical: timestamp_ms \n METHOD \n /api/v1.0/path \n query_string \n body
-    canonical = "{}\nGET\n/api/v1.0{}\n{}\n".format(ts_ms, path, qs)
-    sig = base64.b64encode(_load_pk().sign(canonical.encode())).decode()
-    return {
-        "X-Api-Key":     APP_KEY_ID,
-        "X-Timestamp":   ts_ms,
-        "X-Nonce":       nonce,
-        "Authorization": sig,
-        "Content-Type":  "application/json",
-    }, qs, canonical
-
-
-# ── REST helpers ──────────────────────────────────────────────────────────────
-
-def _get(path, params=None, timeout=30):
-    headers, qs, canonical = _auth_headers(path, params)
+    body_bytes = json.dumps(body, separators=(",", ":")).encode() if body is not None else b""
+    headers, canonical = _signed_headers(method, path, qs, body_bytes)
     url = "{}{}".format(MOOMOO_API, path) + ("?{}".format(qs) if qs else "")
     try:
-        r = requests.get(url, headers=headers, timeout=timeout)
+        r = requests.request(method, url, headers=headers, data=body_bytes or None, timeout=timeout)
     except requests.RequestException as exc:
-        st.error("Network error {}: {}".format(path, exc))
+        if not quiet:
+            st.error("Network error {}: {}".format(path, exc))
+        return None
+    if quiet and not r.ok:
         return None
 
     if r.ok:
         j = r.json()
         rc = j.get("ret_code", 0) if isinstance(j, dict) else 0
         if rc != 0:
-            st.error("API {} → ret_code {} — {}".format(path, rc, j.get("ret_msg", "")))
-            with st.expander("Error detail"):
-                st.json(j)
+            if not quiet:
+                st.error("API {} {} → ret_code {} — {}".format(method, path, rc, j.get("ret_msg", "")))
+                with st.expander("Error detail"):
+                    st.json(j)
             return None
         return j
 
-    st.error("API {} → {}".format(path, r.status_code))
+    st.error("API {} {} → {}".format(method, path, r.status_code))
     with st.expander("Error detail"):
         st.code(r.text)
-        st.caption("Canonical path: `/api/v1.0{}`".format(path))
-        st.caption("Canonical string:\n```\n{}```".format(canonical))
+        st.caption("Signing string:\n```\n{}\n```".format(canonical))
     return None
 
 
-def _post(path, body, timeout=60):
-    """AppKey-signed POST (used by the option screener, whose filter is a JSON body)."""
-    import json as _json
-    payload = _json.dumps(body, separators=(",", ":"))
-    ts_ms = str(int(time.time() * 1000))
-    canonical = "{}\nPOST\n/api/v1.0{}\n\n{}".format(ts_ms, path, payload)
-    sig = base64.b64encode(_load_pk().sign(canonical.encode())).decode()
-    headers = {"X-Api-Key": APP_KEY_ID, "X-Timestamp": ts_ms, "X-Nonce": _sec.token_hex(16),
-               "Authorization": sig, "Content-Type": "application/json"}
-    try:
-        r = requests.post("{}{}".format(MOOMOO_API, path), headers=headers, data=payload, timeout=timeout)
-    except requests.RequestException:
-        return None
-    if not r.ok:
-        return None
-    j = r.json()
-    return j if isinstance(j, dict) and j.get("ret_code", 0) == 0 else None
+def _get(path, params=None, timeout=30):
+    return _request("GET", path, params=params, timeout=timeout)
+
+
+def _post(path, body, timeout=60, quiet=False):
+    return _request("POST", path, body=body, timeout=timeout, quiet=quiet)
 
 
 def us(ticker: str) -> str:
@@ -155,8 +148,20 @@ def us(ticker: str) -> str:
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_snapshot(tickers_csv):
-    code_list = ",".join(us(t.strip()) for t in tickers_csv.split(",") if t.strip())
-    return _get("/quote/stock_quote", {"code_list": code_list})
+    code_list = [us(t.strip()) for t in tickers_csv.split(",") if t.strip()]
+    return _post("/quote/stock-quote", {"code_list": code_list})
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_market_snapshots(codes):
+    """Bid/ask, OI, volume, IV and Greeks for any codes (POST /quote/snapshot, 400 per call)."""
+    out = []
+    codes = list(codes)
+    for i in range(0, len(codes), 400):
+        payload = _post("/quote/snapshot", {"code_list": codes[i:i + 400]})
+        if payload and "data" in payload:
+            out.extend(payload["data"].get("snapshot_list") or [])
+    return out
 
 
 def _to_ymd(date_str):
@@ -169,7 +174,7 @@ def _to_ymd(date_str):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_expirations(ticker):
-    data = _get("/quote/option_expiration_date", {"code": us(ticker)})
+    data = _get("/quote/{}/option-expiration".format(us(ticker)))
     if not data or "data" not in data:
         return []
     d = data["data"]
@@ -189,12 +194,17 @@ def fetch_expirations(ticker):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_option_chain(ticker, expiry):
-    # REST API uses start/end (yyyy-MM-dd) matching the MCP tool date format
-    return _get("/quote/option_chain", {
-        "code":  us(ticker),
-        "start": expiry,
-        "end":   expiry,
-    }, timeout=60)
+    """Contracts for one expiry, enriched with live quotes.
+    GET /quote/{symbol}/option-chain only returns codes and strikes, so prices,
+    OI and Greeks come from /quote/snapshot and are merged into each contract."""
+    chain = _get("/quote/{}/option-chain".format(us(ticker)), {"start": expiry, "end": expiry}, timeout=60)
+    if not chain or "data" not in chain:
+        return chain
+    contracts = chain["data"].get("option_chain") or []
+    snaps = {s.get("code"): s for s in fetch_market_snapshots(tuple(c["code"] for c in contracts))}
+    for c in contracts:
+        c.update({k: v for k, v in snaps.get(c["code"], {}).items() if k not in ("option_type", "name")})
+    return chain
 
 
 def _contract_row(opt, option_type_str):
@@ -206,9 +216,9 @@ def _contract_row(opt, option_type_str):
             "last":          float(opt.get("last_price",        0) or 0),
             "bid":           float(opt.get("bid_price",         0) or 0),
             "ask":           float(opt.get("ask_price",         0) or 0),
-            "open_interest": int(opt.get("open_interest",       0) or 0),
+            "open_interest": int(opt.get("option_open_interest") or opt.get("open_interest") or 0),
             "volume":        int(opt.get("volume",              0) or 0),
-            "iv":            float(opt.get("implied_volatility", 0) or 0),
+            "iv":            float(opt.get("option_implied_volatility") or opt.get("implied_volatility") or 0) / 100,
             "delta":         float(opt.get("delta",             0) or 0),
             "gamma":         float(opt.get("gamma",             0) or 0),
             "theta":         float(opt.get("theta",             0) or 0),
@@ -370,7 +380,8 @@ if page == "Dashboard":
             for i, item in enumerate(snap_list):
                 code = str(item.get("code", "")).replace("US.", "")
                 last = float(item.get("last_price", 0) or item.get("cur_price", 0))
-                chg  = float(item.get("change_rate", 0) or item.get("change_val", 0))
+                prev = float(item.get("prev_close_price", 0) or 0)
+                chg  = float(item.get("change_rate", 0) or 0) or ((last - prev) / prev * 100 if prev else 0.0)
                 cols[i % 4].metric(code, f"${last:.2f}", delta=f"{chg:+.2f}%", delta_color="normal")
         else:
             st.info("No snapshot data returned.")
@@ -808,12 +819,8 @@ def _rows(payload, *keys):
 
 
 def fetch_option_snapshots(codes):
-    """Greeks, bid/ask, OI and volume for option codes (chunked GET /quote/market_snapshot)."""
-    out = []
-    for i in range(0, len(codes), 150):
-        payload = _get("/quote/market_snapshot", {"code_list": ",".join(codes[i:i + 150])}, timeout=60)
-        out.extend(_rows(payload, "snapshot_list"))
-    return out
+    """Greeks, bid/ask, OI and volume for option codes."""
+    return fetch_market_snapshots(tuple(codes))
 
 
 def fetch_underlyings(tickers):
@@ -834,7 +841,7 @@ def fetch_most_active(limit, min_volume, max_dte):
     }
     body = {"strategy": strategy, "limit": limit,
             "field_filter": {"option_name": "x", "volume": 1, "open_interest": 1, "oi_day_chg": 1, "left_day": 1}}
-    return _rows(_post("/quote/option_screen", body), "option_list")
+    return _rows(_post("/quote/option-screen", body), "option_list")
 
 
 def fetch_universe_codes(tickers, n_expiries, strikes_each_side):
