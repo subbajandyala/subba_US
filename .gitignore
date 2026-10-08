@@ -22,3 +22,6 @@ Thumbs.db
 # Secrets
 *.pem
 *.key
+
+# Streamlit local secrets (MooMoo private key)
+.streamlit/secrets.toml

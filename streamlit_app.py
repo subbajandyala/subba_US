@@ -127,6 +127,25 @@ def _get(path, params=None, timeout=30):
     return None
 
 
+def _post(path, body, timeout=60):
+    """AppKey-signed POST (used by the option screener, whose filter is a JSON body)."""
+    import json as _json
+    payload = _json.dumps(body, separators=(",", ":"))
+    ts_ms = str(int(time.time() * 1000))
+    canonical = "{}\nPOST\n/api/v1.0{}\n\n{}".format(ts_ms, path, payload)
+    sig = base64.b64encode(_load_pk().sign(canonical.encode())).decode()
+    headers = {"X-Api-Key": APP_KEY_ID, "X-Timestamp": ts_ms, "X-Nonce": _sec.token_hex(16),
+               "Authorization": sig, "Content-Type": "application/json"}
+    try:
+        r = requests.post("{}{}".format(MOOMOO_API, path), headers=headers, data=payload, timeout=timeout)
+    except requests.RequestException:
+        return None
+    if not r.ok:
+        return None
+    j = r.json()
+    return j if isinstance(j, dict) and j.get("ret_code", 0) == 0 else None
+
+
 def us(ticker: str) -> str:
     t = ticker.upper().strip()
     return t if t.startswith("US.") else f"US.{t}"
@@ -324,7 +343,8 @@ with st.sidebar:
     st.caption(f"AppKey: …{APP_KEY_ID[-8:]}")
     page = st.radio(
         "Navigate",
-        ["Dashboard", "Options Chain", "OI Signal", "Expiry Analyzer", "OI Scanner", "Smart Signal"],
+        ["Dashboard", "Options Chain", "OI Signal", "Expiry Analyzer", "OI Scanner", "Smart Signal",
+         "Options Radar", "Radar Results"],
         label_visibility="collapsed",
     )
 
@@ -765,3 +785,279 @@ elif page == "Smart Signal":
                                   "CE Wall":"${:.0f}","PE Wall":"${:.0f}"}),
             use_container_width=True,
         )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# OPTIONS RADAR — data helpers
+# ════════════════════════════════════════════════════════════════════════════
+
+import glob as _glob
+import radar_engine as radar
+
+RADAR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "radar")
+
+
+def _rows(payload, *keys):
+    if not payload or "data" not in payload:
+        return []
+    d = payload["data"]
+    for k in keys:
+        if d.get(k):
+            return d[k]
+    return []
+
+
+def fetch_option_snapshots(codes):
+    """Greeks, bid/ask, OI and volume for option codes (chunked GET /quote/market_snapshot)."""
+    out = []
+    for i in range(0, len(codes), 150):
+        payload = _get("/quote/market_snapshot", {"code_list": ",".join(codes[i:i + 150])}, timeout=60)
+        out.extend(_rows(payload, "snapshot_list"))
+    return out
+
+
+def fetch_underlyings(tickers):
+    out = []
+    for i in range(0, len(tickers), 150):
+        out.extend(_rows(fetch_snapshot(",".join(tickers[i:i + 150])), "quote_list", "snapshot_list"))
+    return out
+
+
+def fetch_most_active(limit, min_volume, max_dte):
+    """MooMoo option screener sorted by volume — the only source of the daily OI change."""
+    strategy = {
+        "market_category_list": [0],
+        "filter_group_list": [
+            {"option_list": [{"indicator_type": 2011, "indicator_value": {"value_interval": {"min_value": min_volume}}}]},
+            {"option_list": [{"indicator_type": 1002, "indicator_value": {"value_interval": {"min_value": 0, "max_value": max_dte}}}]},
+        ],
+    }
+    body = {"strategy": strategy, "limit": limit,
+            "field_filter": {"option_name": "x", "volume": 1, "open_interest": 1, "oi_day_chg": 1, "left_day": 1}}
+    return _rows(_post("/quote/option_screen", body), "option_list")
+
+
+def fetch_universe_codes(tickers, n_expiries, strikes_each_side):
+    """Fallback when the screener is unavailable: near-ATM contracts of the next expiries per ticker."""
+    codes = []
+    spots = {q.get("code"): float(q.get("last_price", 0) or 0) for q in fetch_underlyings(tickers)}
+    for tk in tickers:
+        spot = spots.get(us(tk), 0)
+        for exp in fetch_expirations(tk)[:n_expiries]:
+            chain = _rows(fetch_option_chain(tk, exp), "option_chain")
+            strikes = sorted({float(c.get("strike_price", 0)) for c in chain})
+            if not strikes or not spot:
+                continue
+            atm_i = min(range(len(strikes)), key=lambda i: abs(strikes[i] - spot))
+            keep = set(strikes[max(0, atm_i - strikes_each_side): atm_i + strikes_each_side + 1])
+            codes += [c["code"] for c in chain if float(c.get("strike_price", 0)) in keep]
+    return codes
+
+
+def _previous_oi():
+    """OI per code from the latest saved scan, used for OI change in fallback mode."""
+    files = sorted(_glob.glob(os.path.join(RADAR_DIR, "*_contracts.csv")))
+    if not files:
+        return {}
+    prev = pd.read_csv(files[-1], usecols=["code", "oi"])
+    return dict(zip(prev["code"], prev["oi"]))
+
+
+def _save_scan(tag, contracts, bias, picks):
+    os.makedirs(RADAR_DIR, exist_ok=True)
+    stamp = pd.Timestamp.now(tz="America/New_York").strftime("%Y-%m-%d_%H%M")
+    base = os.path.join(RADAR_DIR, "{}_{}".format(stamp, tag))
+    contracts.to_csv(base + "_contracts.csv", index=False)
+    bias.to_csv(base + "_bias.csv", index=False)
+    picks.to_csv(base + "_picks.csv", index=False)
+    return base
+
+
+def _color_signal(styler):
+    fn = getattr(styler, "map", None) or styler.applymap   # Styler.applymap was renamed to map
+    return fn(_signal_style, subset=["signal"])
+
+
+def _signal_style(v):
+    s = str(v)
+    if "STRONG BUY CALL" in s: return "color:#22c55e;font-weight:700"
+    if "BUY CALL" in s:        return "color:#86efac"
+    if "STRONG BUY PUT" in s:  return "color:#ef4444;font-weight:700"
+    if "BUY PUT" in s:         return "color:#fca5a5"
+    return "color:#94a3b8"
+
+
+RADAR_HELP = """
+**How to read it**
+
+| OI | Option price (after removing what delta + theta explain) | Reading | For the stock |
+|---|---|---|---|
+| ↑ | ↑ | Long buildup (buyers) | Call → bullish · Put → bearish |
+| ↑ | ↓ | Short buildup (writers) | Call → resistance · Put → support |
+| ↓ | ↑ | Short covering | Call → bullish · Put → bearish |
+| ↓ | ↓ | Long unwinding | no read |
+
+- **Fresh** = volume > open interest (new positions today). **Stealth** = big volume, small price move.
+- Options with 0–1 days left are shown but **not** used for direction (decay swamps the signal).
+- A ticker needs ≥3 active contracts with both calls and puts, otherwise **LOW DATA**.
+- **Buyer quality (0–100)** penalises delta outside 0.30–0.65, wide bid/ask, fast theta decay, 0 DTE, >21 DTE, OI < 1,000.
+
+Research tool — one day of signals proves nothing. Track results in **Radar Results** for weeks before trusting a reading.
+"""
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# PAGE: OPTIONS RADAR
+# ════════════════════════════════════════════════════════════════════════════
+
+if page == "Options Radar":
+    st.title("Options Radar")
+    st.caption("Most active US options · where open interest was added · Greeks-based contract pick")
+    with st.expander("How it works"):
+        st.markdown(RADAR_HELP)
+
+    mode = st.radio("Universe", ["Most active (MooMoo screener)", "My tickers"], horizontal=True)
+    c1, c2, c3 = st.columns(3)
+    if mode.startswith("Most"):
+        limit = c1.slider("Contracts", 50, 400, 300, 50)
+        min_vol = c2.number_input("Min volume", 100, 100000, 2000, 500)
+        max_dte = c3.slider("Max days to expiry", 1, 90, 45)
+    else:
+        tickers_in = st.text_input("Tickers", "SPY,QQQ,IWM,NVDA,TSLA,AAPL,AMZN,META,MSFT,AMD")
+        n_exp = c1.slider("Expiries per ticker", 1, 4, 2)
+        width = c2.slider("Strikes each side of ATM", 2, 15, 6)
+
+    if st.button("Run scan", type="primary"):
+        with st.spinner("Fetching option data from MooMoo…"):
+            screen = []
+            if mode.startswith("Most"):
+                screen = fetch_most_active(int(limit), int(min_vol), int(max_dte))
+                codes = [r["code"] for r in screen]
+                if not codes:
+                    st.warning("Screener endpoint returned nothing — switch to **My tickers** mode.")
+                    st.stop()
+            else:
+                tickers = [t.strip().upper() for t in tickers_in.split(",") if t.strip()]
+                codes = fetch_universe_codes(tickers, n_exp, width)
+            snaps = fetch_option_snapshots(codes)
+            und_tickers = sorted({m.group(1) for m in (radar.CODE_RE.match(c) for c in codes) if m})
+            unds = fetch_underlyings(und_tickers)
+
+        if not snaps:
+            st.error("No option snapshots returned.")
+            st.stop()
+        if not screen:   # fallback mode: OI change vs the last saved scan
+            prev = _previous_oi()
+            screen = [{"code": s["code"], "oi_day_chg": float(s.get("option_open_interest", 0) or 0) - prev[s["code"]]}
+                      for s in snaps if s.get("code") in prev]
+
+        df = radar.analyze(radar.build_table(snaps, unds, screen))
+        bias = radar.underlying_bias(df)
+        picks = radar.pick_contracts(df, bias)
+        base = _save_scan("scan", df, bias, picks)
+        st.session_state["radar"] = (df, bias, picks, base)
+
+    if "radar" in st.session_state:
+        df, bias, picks, base = st.session_state["radar"]
+        n_sig = int(bias["signal"].str.contains("BUY").sum()) if not bias.empty else 0
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Contracts", len(df))
+        m2.metric("Tickers", df["ticker"].nunique())
+        m3.metric("Ticker signals", n_sig)
+        m4.metric("Data date", str(df["data_date"].iloc[0]))
+        st.caption("Saved as `{}_*.csv` — open **Radar Results** later to see how it performed.".format(os.path.basename(base)))
+
+        st.subheader("Picks — best contract per signal")
+        if picks.empty:
+            st.info("No ticker has a clear signal right now. That is a valid result — no trade.")
+        else:
+            cols = ["signal", "code", "dte", "spot", "strike", "mid", "delta", "iv", "theta_pct", "spread_pct", "oi", "buyer_q"]
+            st.dataframe(picks[cols].style.pipe(_color_signal)
+                         .format({"spot": "${:.2f}", "strike": "${:.2f}", "mid": "${:.2f}", "delta": "{:.2f}",
+                                  "iv": "{:.1f}", "theta_pct": "{:.1f}%", "spread_pct": "{:.1f}%",
+                                  "oi": "{:,.0f}", "buyer_q": "{:.0f}"}),
+                         use_container_width=True, hide_index=True)
+
+        st.subheader("Ticker bias from option flow")
+        st.dataframe(bias.style.pipe(_color_signal),
+                     use_container_width=True, hide_index=True)
+
+        st.subheader("Hot contracts — fresh positions (2+ days to expiry)")
+        hot = df[df["dte"] >= 2].sort_values(["buildup_score", "volume"], ascending=False).head(30)
+        st.dataframe(hot[["code", "type", "dte", "spot", "strike", "mid", "volume", "oi", "oi_chg", "vol_oi",
+                          "excess_pct", "buildup", "buildup_tags", "delta", "iv", "theta_pct", "spread_pct", "buyer_q"]]
+                     .round(2), use_container_width=True, hide_index=True)
+
+        with st.expander("All contracts"):
+            st.dataframe(df.round(3), use_container_width=True, hide_index=True)
+        st.download_button("Download scan CSV", df.to_csv(index=False).encode(),
+                           file_name=os.path.basename(base) + "_contracts.csv", mime="text/csv")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# PAGE: RADAR RESULTS
+# ════════════════════════════════════════════════════════════════════════════
+
+elif page == "Radar Results":
+    st.title("Radar Results")
+    st.caption("Re-price a saved scan with live MooMoo data: did the readings predict the move?")
+
+    files = sorted(_glob.glob(os.path.join(RADAR_DIR, "*_contracts.csv")), reverse=True)
+    choice = st.selectbox("Saved scan", [os.path.basename(f) for f in files]) if files else None
+    upload = st.file_uploader("…or upload a scan CSV", type="csv")
+    if not choice and not upload:
+        st.info("No saved scans yet — run **Options Radar** first.")
+        st.stop()
+
+    if st.button("Check performance now", type="primary"):
+        base_df = pd.read_csv(upload) if upload else pd.read_csv(os.path.join(RADAR_DIR, choice))
+        with st.spinner("Re-pricing {} contracts…".format(len(base_df))):
+            snaps = fetch_option_snapshots(base_df["code"].tolist())
+            unds = fetch_underlyings(sorted(base_df["ticker"].unique().tolist()))
+        now = radar.build_table(snaps, unds)
+        if now.empty:
+            st.error("No live data returned.")
+            st.stop()
+        m, hit = radar.track(base_df, now)
+
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Contracts re-priced", len(m))
+        k2.metric("Avg option return", "{:+.1f}%".format(m["opt_ret_pct"].mean()))
+        k3.metric("Winners", "{}/{}".format(int((m["opt_ret_pct"] > 0).sum()), len(m)))
+
+        st.subheader("Did each buildup reading predict the stock? (2+ DTE)")
+        if hit.empty:
+            st.info("No directional readings in this scan.")
+        else:
+            st.dataframe(hit, use_container_width=True, hide_index=True)
+            st.caption("Hit rate above 0.5 on one day is noise. Look for readings that stay above 0.5 across many scans.")
+
+        if not choice:
+            bias_path = picks_path = ""
+        else:
+            bias_path = os.path.join(RADAR_DIR, choice.replace("_contracts.csv", "_bias.csv"))
+            picks_path = os.path.join(RADAR_DIR, choice.replace("_contracts.csv", "_picks.csv"))
+        if bias_path and os.path.exists(bias_path):
+            b = pd.read_csv(bias_path)
+            b = b[b["signal"].str.contains("BUY")]
+            if not b.empty:
+                spot_now = m.groupby("ticker")["spot_now"].first()
+                b["spot_now"] = b["ticker"].map(spot_now)
+                b["stock_ret_pct"] = (b["spot_now"] - b["spot"]) / b["spot"] * 100
+                b["signal_right"] = [("CALL" in s and r > 0) or ("PUT" in s and r < 0)
+                                     for s, r in zip(b["signal"], b["stock_ret_pct"])]
+                st.subheader("Ticker signals")
+                st.dataframe(b[["ticker", "signal", "spot", "spot_now", "stock_ret_pct", "signal_right"]].round(2),
+                             use_container_width=True, hide_index=True)
+        if picks_path and os.path.exists(picks_path) and os.path.getsize(picks_path) > 5:
+            p = pd.read_csv(picks_path)[["code", "signal"]].merge(
+                m[["code", "mid_then", "mid_now", "opt_ret_pct"]], on="code")
+            st.subheader("Picked contracts")
+            st.dataframe(p.round(2), use_container_width=True, hide_index=True)
+
+        cols = ["code", "type", "dte", "buildup", "spot_then", "spot_now", "spot_ret_pct", "mid_then", "mid_now", "opt_ret_pct"]
+        b1, b2 = st.columns(2)
+        b1.markdown("**Best 10**")
+        b1.dataframe(m.sort_values("opt_ret_pct", ascending=False)[cols].head(10).round(2), hide_index=True)
+        b2.markdown("**Worst 10**")
+        b2.dataframe(m.sort_values("opt_ret_pct")[cols].head(10).round(2), hide_index=True)
