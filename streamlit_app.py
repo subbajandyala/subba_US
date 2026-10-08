@@ -354,7 +354,7 @@ with st.sidebar:
     page = st.radio(
         "Navigate",
         ["Dashboard", "Options Chain", "OI Signal", "Expiry Analyzer", "OI Scanner", "Smart Signal",
-         "Options Radar", "Radar Results"],
+         "Options Radar", "Radar Results", "Connection Check"],
         label_visibility="collapsed",
     )
 
@@ -1068,3 +1068,58 @@ elif page == "Radar Results":
         b1.dataframe(m.sort_values("opt_ret_pct", ascending=False)[cols].head(10).round(2), hide_index=True)
         b2.markdown("**Worst 10**")
         b2.dataframe(m.sort_values("opt_ret_pct")[cols].head(10).round(2), hide_index=True)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# PAGE: CONNECTION CHECK
+# ════════════════════════════════════════════════════════════════════════════
+
+elif page == "Connection Check":
+    from cryptography.hazmat.primitives import serialization as _ser
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey as _Ed
+
+    st.title("Connection Check")
+    st.caption("Diagnoses MooMoo 401 errors. Shows only the PUBLIC key — the private key never leaves the server.")
+
+    try:
+        pk = _load_pk()
+    except Exception as exc:
+        st.error("MOOMOO_PRIVATE_KEY could not be loaded: {}".format(type(exc).__name__))
+        st.markdown("Paste the full PEM including the `-----BEGIN PRIVATE KEY-----` / `-----END PRIVATE KEY-----` lines.")
+        st.stop()
+
+    c1, c2 = st.columns(2)
+    c1.metric("AppKey ID", "…" + APP_KEY_ID[-8:])
+    c2.metric("Key type", "Ed25519" if isinstance(pk, _Ed) else type(pk).__name__)
+    if not isinstance(pk, _Ed):
+        st.warning("This is not an Ed25519 key. If the AppKey was created with RSA-SHA256, the app's signing must use RSA.")
+
+    pub = pk.public_key()
+    st.markdown("**Public key derived from your private key** — must match the one uploaded for this AppKey "
+                "at open.moomoo.com → AppKey Management:")
+    st.code(pub.public_bytes(_ser.Encoding.PEM, _ser.PublicFormat.SubjectPublicKeyInfo).decode())
+    if isinstance(pk, _Ed):
+        st.caption("Raw base64: `{}`".format(base64.b64encode(
+            pub.public_bytes(_ser.Encoding.Raw, _ser.PublicFormat.Raw)).decode()))
+
+    if st.button("Test connection", type="primary"):
+        try:
+            server_ms = int(requests.get(MOOMOO_API + "/server-time", timeout=15).json()["server_time_ms"])
+            offset = server_ms - int(time.time() * 1000)
+            (st.success if abs(offset) < 5000 else st.error)("Clock offset vs MooMoo: {} ms".format(offset))
+        except Exception as exc:
+            st.error("Could not reach /server-time: {}".format(exc))
+
+        for method, path, params, body in [
+            ("GET", "/quote/US.AAPL/option-expiration", None, None),
+            ("POST", "/quote/stock-quote", None, {"code_list": ["US.SPY"]}),
+        ]:
+            qs = urllib.parse.urlencode(params) if params else ""
+            body_bytes = json.dumps(body, separators=(",", ":")).encode() if body is not None else b""
+            headers, canonical = _signed_headers(method, path, qs, body_bytes)
+            r = requests.request(method, MOOMOO_API + path + ("?" + qs if qs else ""),
+                                 headers=headers, data=body_bytes or None, timeout=20)
+            (st.success if r.ok else st.error)("{} {} → HTTP {}".format(method, path, r.status_code))
+            st.code(r.text[:600])
+            with st.expander("Signing string sent"):
+                st.code(canonical)
